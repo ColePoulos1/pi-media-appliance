@@ -1,0 +1,12 @@
+# Working on the Pi media appliance
+
+Start with the [product requirements](docs/appliance/requirements.md), the [playback contract](docs/appliance/stream-selection.md), and the [engineering handoff](docs/appliance/handoff.md). The handoff records the upstream pins, paths, first task, status, and acceptance runs. These files are sufficient on a fresh clone.
+
+- The active project is a Pi 5 microSD image built with LibreELEC and this Kodi application fork. Keep appliance UI and business logic here. Reuse LibreELEC's board packages. The native/libVLC experiment is a separate alternative.
+- Use the existing Kodi input, player, rendering, audio, library and remote interfaces. Keep normal playback of ordinary Kodi file items working. Scope the automatic selector to appliance title playback and make TV, favorites, Continue Watching, episode and iOS entry points agree.
+- Follow the source call chain before editing. In this base, the error callback also posts a stopped event. Distinguish explicit Stop, normal completion, cancellation and failure. Guard retries against stale callbacks. A signed URL is transient and a bookmark belongs to the title.
+- Keep the approved source-selection behavior intact across tuning. Start with deterministic rules and synthetic movie/episode fixtures. Use the smallest relevant upstream test target. Measure Pi-specific behavior on the named OS build, TV and device. Desktop results prove desktop behavior.
+- Implement new product features in native C++. Ship one fixed UI using Kodi's existing GUI while it serves the product. Only remove an internal dependency after identifying its callers and measuring the benefit. TV-remote CEC **input** is the whole CEC requirement.
+- Keep API keys, SMB credentials, private endpoints, signed URLs, magnets, source captures, watch history, screenshots with personal data and Kodi userdata outside Git. Store the user's account material on their Pi. Use only publishable synthetic evidence in the repo.
+- Preserve Kodi licensing and notices. The Fen Light+ behavior is a reference. Verify reuse rights before bringing in third-party code or artwork.
+- When advancing a milestone, update the status and evidence in the handoff. Record the exact revision, commands or hardware test run, result and next open question. Label proposed budgets and unmeasured behavior. Keep any new agent instructions here or next to the code they govern.

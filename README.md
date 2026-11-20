@@ -1,3 +1,18 @@
+# Pi media appliance
+
+A Raspberry Pi 5 image for people who want to plug in a TV remote–controlled player, connect to Wi-Fi, link TorBox, and press Play. A single search covers movies and episodes in local folders, on SMB shares, and in the online catalog. Eligible downloaded copies play first. Bookmarks and favorites follow the title across sources.
+
+**Phase:** design and upstream baseline. The `appliance` branch starts at Kodi 21.3-Omega, the version packaged by LibreELEC 12.2.1. The fork currently runs upstream Kodi behavior. The intended first result is a movie and an episode playing end to end on a Pi 5.
+
+| Start here | What it answers |
+| --- | --- |
+| [Requirements](docs/appliance/requirements.md) | Who the appliance serves, what ships, and what the viewer configures |
+| [Engineering handoff](docs/appliance/handoff.md) | Exact revisions, build steps, source entry points, milestones, current status and hardware checks |
+| [Automatic source selection](docs/appliance/stream-selection.md) | Local priority, ranking, language, retries, resume and worked examples |
+| [AGENTS.md](AGENTS.md) | Instructions for the next contributor or coding agent |
+
+## Upstream Kodi documentation
+
 ![Kodi Logo](docs/resources/banner.png)
 
 <p align="center">
