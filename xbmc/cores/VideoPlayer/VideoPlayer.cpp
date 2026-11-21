@@ -2585,16 +2585,10 @@ void CVideoPlayer::OnExit()
   CFFmpegLog::ClearLogLevel();
   m_bStop = true;
 
-  bool error = m_error;
-  bool close = m_bCloseRequest;
-  m_outboundEvents->Submit([=]() {
-    if (close)
-      cb->OnPlayBackStopped();
-    else if (error)
-      cb->OnPlayBackError();
-    else
-      cb->OnPlayBackEnded();
-  });
+  const auto reason = m_bCloseRequest ? PlaybackTermination::Stopped
+                      : m_error       ? PlaybackTermination::Failed
+                                      : PlaybackTermination::Ended;
+  m_outboundEvents->Submit([=]() { cb->OnPlaybackTerminated(fileItem, reason); });
 }
 
 void CVideoPlayer::HandleMessages()

@@ -241,6 +241,11 @@ public:
   bool m_AppFocused{true};
 
 private:
+  struct AppliancePlayback;
+  bool PlayFileInternal(CFileItem item, const std::string& player, bool bRestart);
+  void TryApplianceSource();
+  void OpenApplianceSource(const std::string& path);
+  void CancelAppliancePlayback();
   void PrintStartupLog();
   void ResetCurrentItem();
 
@@ -252,6 +257,9 @@ private:
   unsigned int m_ProcessedExternalDecay = 0;      /*!< counts to close door after a few frames of no python activity */
   int m_ExitCode{EXITCODE_QUIT};
   std::shared_ptr<CFileItem> m_itemCurrentFile; //!< Currently playing file
+  std::shared_ptr<AppliancePlayback> m_appliancePlayback;
+  int64_t m_applianceSerial{0};
+  int64_t m_applianceSourceToken{0};
   CEvent m_playerEvent;
 };
 

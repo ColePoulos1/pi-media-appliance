@@ -1026,8 +1026,8 @@ void PLAYLIST::CPlayListPlayer::OnApplicationMessage(KODI::MESSAGING::ThreadMess
 
     wakeScreensaver();
 
-    // stop playing file
-    if (appPlayer->IsPlaying())
+    // A video Stop can also cancel a pending source lookup.
+    if (appPlayer->IsPlaying() || stopVideo)
       g_application.StopPlaying();
   }
   break;

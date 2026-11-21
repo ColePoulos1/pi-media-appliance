@@ -15,6 +15,13 @@
 class CFileItem;
 class CBookmark;
 
+enum class PlaybackTermination
+{
+  Stopped,
+  Failed,
+  Ended,
+};
+
 class IPlayerCallback
 {
 public:
@@ -26,6 +33,21 @@ public:
   virtual void OnPlayBackResumed() {}
   virtual void OnPlayBackStopped() = 0;
   virtual void OnPlayBackError() = 0;
+  virtual void OnPlaybackTerminated(const CFileItem&, PlaybackTermination reason)
+  {
+    switch (reason)
+    {
+      case PlaybackTermination::Stopped:
+        OnPlayBackStopped();
+        break;
+      case PlaybackTermination::Failed:
+        OnPlayBackError();
+        break;
+      case PlaybackTermination::Ended:
+        OnPlayBackEnded();
+        break;
+    }
+  }
   virtual void OnQueueNextItem() = 0;
   virtual void OnPlayBackSeek(int64_t iTime, int64_t seekOffset) {}
   virtual void OnPlayBackSeekChapter(int iChapter) {}

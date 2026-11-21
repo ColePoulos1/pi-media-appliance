@@ -1,4 +1,5 @@
-set(SOURCES TestStacks.cpp
+set(SOURCES TestAppliancePlayback.cpp
+            TestStacks.cpp
             TestVideoInfoScanner.cpp)
 
 core_add_test_library(video_test)

@@ -1,4 +1,5 @@
-set(SOURCES Bookmark.cpp
+set(SOURCES AppliancePlayback.cpp
+            Bookmark.cpp
             ContextMenus.cpp
             GUIViewStateVideo.cpp
             PlayerController.cpp
@@ -17,7 +18,8 @@ set(SOURCES Bookmark.cpp
             VideoUtils.cpp
             ViewModeSettings.cpp)
 
-set(HEADERS Bookmark.h
+set(HEADERS AppliancePlayback.h
+            Bookmark.h
             ContextMenus.h
             Episode.h
             GUIViewStateVideo.h

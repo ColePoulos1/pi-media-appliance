@@ -31,6 +31,7 @@
 #include "utils/SaveFileStateJob.h"
 #include "utils/URIUtils.h"
 #include "utils/log.h"
+#include "video/AppliancePlayback.h"
 #include "video/VideoDatabase.h"
 #include "video/VideoInfoTag.h"
 
@@ -75,6 +76,9 @@ void CApplicationPlayerCallback::OnPlayBackStarted(const CFileItem& file)
     itemCurrentFile = std::make_shared<CFileItem>(*stackHelper->GetRegisteredStack(file));
   else
     itemCurrentFile = std::make_shared<CFileItem>(file);
+  const int64_t token = file.GetProperty(KODI::APPLIANCE::SOURCE_TOKEN).asInteger();
+  if (token)
+    itemCurrentFile->SetDynPath({});
 
   /* When playing video pause any low priority jobs, they will be unpaused  when playback stops.
    * This should speed up player startup for files on internet filesystems (eg. webdav) and
@@ -87,7 +91,7 @@ void CApplicationPlayerCallback::OnPlayBackStarted(const CFileItem& file)
 
   stackHelper->OnPlayBackStarted(file);
 
-  CGUIMessage msg(GUI_MSG_PLAYBACK_STARTED, 0, 0, 0, 0, itemCurrentFile);
+  CGUIMessage msg(GUI_MSG_PLAYBACK_STARTED, 0, 0, token, 0, itemCurrentFile);
   CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(msg);
 }
 
@@ -100,6 +104,8 @@ void CApplicationPlayerCallback::OnPlayerCloseFile(const CFileItem& file,
   std::unique_lock<CCriticalSection> lock(stackHelper->m_critSection);
 
   CFileItem fileItem(file);
+  if (fileItem.HasProperty(KODI::APPLIANCE::SOURCE_TOKEN))
+    fileItem.SetDynPath({});
   CBookmark bookmark = bookmarkParam;
   CBookmark resumeBookmark;
   bool playCountUpdate = false;
@@ -202,6 +208,20 @@ void CApplicationPlayerCallback::OnPlayBackError()
   OnPlayBackStopped();
 }
 
+void CApplicationPlayerCallback::OnPlaybackTerminated(const CFileItem& file,
+                                                     PlaybackTermination reason)
+{
+  const int64_t token = file.GetProperty(KODI::APPLIANCE::SOURCE_TOKEN).asInteger();
+  if (!token)
+  {
+    IPlayerCallback::OnPlaybackTerminated(file, reason);
+    return;
+  }
+
+  CGUIMessage msg(GUI_MSG_APPLIANCE_SOURCE_TERMINATED, 0, 0, token, static_cast<int>(reason));
+  CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(msg);
+}
+
 void CApplicationPlayerCallback::OnQueueNextItem()
 {
   CLog::LogF(LOGDEBUG, "CApplication::OnQueueNextItem");
@@ -258,7 +278,8 @@ void CApplicationPlayerCallback::OnAVStarted(const CFileItem& file)
 {
   CLog::LogF(LOGDEBUG, "CApplication::OnAVStarted");
 
-  CGUIMessage msg(GUI_MSG_PLAYBACK_AVSTARTED, 0, 0);
+  CGUIMessage msg(GUI_MSG_PLAYBACK_AVSTARTED, 0, 0,
+                  file.GetProperty(KODI::APPLIANCE::SOURCE_TOKEN).asInteger());
   CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(msg);
 }
 

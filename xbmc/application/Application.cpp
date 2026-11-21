@@ -131,6 +131,7 @@
 #include "utils/FileExtensionProvider.h"
 #include "utils/JobManager.h"
 #include "utils/LangCodeExpander.h"
+#include "utils/Mime.h"
 #include "utils/PlayerUtils.h"
 #include "utils/RegExp.h"
 #include "utils/Screenshot.h"
@@ -141,6 +142,7 @@
 #include "utils/Variant.h"
 #include "utils/XTimeUtils.h"
 #include "utils/log.h"
+#include "video/AppliancePlayback.h"
 #include "video/Bookmark.h"
 #include "video/PlayerController.h"
 #include "video/VideoLibraryQueue.h"
@@ -2148,6 +2150,7 @@ bool CApplication::Stop(int exitCode)
     CLog::Log(LOGINFO, "Stopping all");
 
     // cancel any jobs from the jobmanager
+    CancelAppliancePlayback();
     CServiceBroker::GetJobManager()->CancelJobs();
 
     // stop scanning before we kill the network and so on
@@ -2365,7 +2368,109 @@ bool CApplication::PlayStack(CFileItem& item, bool bRestart)
   return PlayFile(selectedStackPart, "", true);
 }
 
+struct CApplication::AppliancePlayback
+{
+  CFileItem title;
+  CVariant entry;
+  CVariant providers;
+  std::vector<std::string> local;
+  size_t nextLocal{0};
+  KODI::APPLIANCE::RemoteFile remote;
+  unsigned int resolutions{0};
+  std::atomic_bool cancelled{false};
+  bool avStarted{false};
+};
+
 bool CApplication::PlayFile(CFileItem item, const std::string& player, bool bRestart)
+{
+  using namespace KODI::APPLIANCE;
+  CancelAppliancePlayback();
+  m_applianceSourceToken = 0;
+  item.ClearProperty(SOURCE_TOKEN);
+  const Title title = GetTitle(item);
+  if (title.key.empty())
+    return PlayFileInternal(std::move(item), player, bRestart);
+
+  GetComponent<CApplicationPlayer>()->ClosePlayer();
+  item.SetPath(title.path);
+  item.SetDynPath({});
+  item.SetContentLookup(false);
+
+  m_appliancePlayback = std::make_shared<AppliancePlayback>();
+  m_appliancePlayback->title = std::move(item);
+  m_appliancePlayback->entry = LoadIndexEntry(title);
+  m_appliancePlayback->local = LocalFiles(m_appliancePlayback->entry);
+  TryApplianceSource();
+  return true;
+}
+
+void CApplication::CancelAppliancePlayback()
+{
+  if (m_appliancePlayback)
+  {
+    m_appliancePlayback->cancelled = true;
+    m_appliancePlayback.reset();
+  }
+}
+
+void CApplication::TryApplianceSource()
+{
+  const auto attempt = m_appliancePlayback;
+  if (!attempt)
+    return;
+
+  m_applianceSourceToken = ++m_applianceSerial;
+  if (attempt->nextLocal < attempt->local.size())
+  {
+    OpenApplianceSource(attempt->local[attempt->nextLocal++]);
+    return;
+  }
+
+  if (attempt->resolutions >= 2 || attempt->entry["query"].asString().empty())
+  {
+    CancelAppliancePlayback();
+    HELPERS::ShowOKDialogText(CVariant{16026}, CVariant{16027});
+    return;
+  }
+
+  const bool discover = attempt->resolutions++ == 0;
+  const int64_t token = m_applianceSourceToken;
+  CServiceBroker::GetJobManager()->Submit(
+      [attempt, discover, token]()
+      {
+        if (attempt->cancelled)
+          return;
+        if (discover)
+        {
+          attempt->providers = KODI::APPLIANCE::LoadProviders();
+          attempt->remote = KODI::APPLIANCE::Discover(attempt->entry, attempt->providers);
+        }
+        if (attempt->cancelled)
+          return;
+        const std::string path =
+            KODI::APPLIANCE::Resolve(attempt->entry, attempt->providers, attempt->remote);
+        if (attempt->cancelled)
+          return;
+        auto result = std::make_shared<CFileItem>(attempt->title);
+        result->SetDynPath(path);
+        CGUIMessage message(GUI_MSG_APPLIANCE_SOURCE_READY, 0, 0, token, !path.empty(), result);
+        CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(message);
+      },
+      CJob::PRIORITY_NORMAL);
+}
+
+void CApplication::OpenApplianceSource(const std::string& path)
+{
+  CFileItem item{m_appliancePlayback->title};
+  item.SetDynPath(path);
+  const std::string mime = CMime::GetMimeType(URIUtils::GetExtension(path));
+  item.SetMimeType(mime.empty() ? "application/octet-stream" : mime);
+  item.SetProperty(KODI::APPLIANCE::SOURCE_TOKEN, m_applianceSourceToken);
+  if (!PlayFileInternal(std::move(item), "VideoPlayer", false))
+    TryApplianceSource();
+}
+
+bool CApplication::PlayFileInternal(CFileItem item, const std::string& player, bool bRestart)
 {
   // Ensure the MIME type has been retrieved for http:// and shout:// streams
   if (item.GetMimeType().empty())
@@ -2395,7 +2500,8 @@ bool CApplication::PlayFile(CFileItem item, const std::string& player, bool bRes
     return false;
 
   // Translate/Resolve the url if needed
-  const std::unique_ptr<IDirectory> dir{CDirectoryFactory::Create(item)};
+  const bool applianceSource = item.HasProperty(KODI::APPLIANCE::SOURCE_TOKEN);
+  const std::unique_ptr<IDirectory> dir{applianceSource ? nullptr : CDirectoryFactory::Create(item)};
   if (dir && !dir->Resolve(item))
   {
     return false;
@@ -2590,7 +2696,8 @@ bool CApplication::PlayFile(CFileItem item, const std::string& player, bool bRes
   }
 
   const auto appVolume = GetComponent<CApplicationVolumeHandling>();
-  appPlayer->OpenFile(item, options, m_ServiceManager->GetPlayerCoreFactory(), player, *this);
+  const bool opened =
+      appPlayer->OpenFile(item, options, m_ServiceManager->GetPlayerCoreFactory(), player, *this);
   appPlayer->SetVolume(appVolume->GetVolumeRatio());
   appPlayer->SetMute(appVolume->IsMuted());
 
@@ -2603,7 +2710,7 @@ bool CApplication::PlayFile(CFileItem item, const std::string& player, bool bRes
   if (item.HasPVRChannelInfoTag())
     CServiceBroker::GetPlaylistPlayer().SetCurrentPlaylist(PLAYLIST::TYPE_NONE);
 
-  return true;
+  return !applianceSource || opened;
 }
 
 void CApplication::PlaybackCleanup()
@@ -2685,6 +2792,7 @@ bool CApplication::IsFullScreen()
 
 void CApplication::StopPlaying()
 {
+  CancelAppliancePlayback();
   CGUIComponent *gui = CServiceBroker::GetGUI();
 
   if (gui)
@@ -2711,6 +2819,53 @@ bool CApplication::OnMessage(CGUIMessage& message)
 {
   switch (message.GetMessage())
   {
+  case GUI_MSG_APPLIANCE_SOURCE_READY:
+    if (m_appliancePlayback && message.GetParam1AsI64() == m_applianceSourceToken)
+    {
+      if (message.GetParam2())
+      {
+        CLog::Log(LOGDEBUG, "Appliance: selected remote file has {} bytes",
+                  m_appliancePlayback->remote.bytes);
+        OpenApplianceSource(std::static_pointer_cast<CFileItem>(message.GetItem())->GetDynPath());
+      }
+      else if (m_appliancePlayback->remote.id >= 0)
+        TryApplianceSource();
+      else
+      {
+        CancelAppliancePlayback();
+        HELPERS::ShowOKDialogText(CVariant{16026}, CVariant{16027});
+      }
+    }
+    return true;
+
+  case GUI_MSG_APPLIANCE_SOURCE_TERMINATED:
+  {
+    if (message.GetParam1AsI64() != m_applianceSourceToken)
+      return true;
+
+    const auto reason = static_cast<PlaybackTermination>(message.GetParam2());
+    if (reason == PlaybackTermination::Failed && m_appliancePlayback &&
+        !m_appliancePlayback->avStarted)
+    {
+      m_playerEvent.Set();
+      ResetCurrentItem();
+      PlaybackCleanup();
+      TryApplianceSource();
+      return true;
+    }
+
+    const bool failed = reason == PlaybackTermination::Failed && m_appliancePlayback;
+    CancelAppliancePlayback();
+    m_applianceSourceToken = 0;
+    CGUIMessage stopped(reason == PlaybackTermination::Ended ? GUI_MSG_PLAYBACK_ENDED
+                                                             : GUI_MSG_PLAYBACK_STOPPED,
+                        0, 0);
+    CServiceBroker::GetGUI()->GetWindowManager().SendMessage(stopped);
+    if (failed)
+      HELPERS::ShowOKDialogText(CVariant{16026}, CVariant{16027});
+    return true;
+  }
+
   case GUI_MSG_NOTIFY_ALL:
     {
       if (message.GetParam1()==GUI_MSG_REMOVED_MEDIA)
@@ -2777,6 +2932,9 @@ bool CApplication::OnMessage(CGUIMessage& message)
 
   case GUI_MSG_PLAYBACK_STARTED:
     {
+      const int64_t token = message.GetParam1AsI64();
+      if (token && token != m_applianceSourceToken)
+        return true;
 #ifdef TARGET_DARWIN_EMBEDDED
       // @TODO move this away to platform code
       CDarwinUtils::SetScheduling(GetComponent<CApplicationPlayer>()->IsPlayingVideo());
@@ -2985,6 +3143,12 @@ bool CApplication::OnMessage(CGUIMessage& message)
 
   case GUI_MSG_PLAYBACK_AVSTARTED:
   {
+    const int64_t token = message.GetParam1AsI64();
+    if (token && token != m_applianceSourceToken)
+      return true;
+    if (token && m_appliancePlayback)
+      m_appliancePlayback->avStarted = true;
+
     CVariant param;
     param["player"]["speed"] = 1;
     param["player"]["playerid"] = CServiceBroker::GetPlaylistPlayer().GetCurrentPlaylist();
