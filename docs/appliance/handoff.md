@@ -1,6 +1,6 @@
 # Engineering handoff
 
-**21 November 2026 · Milestone 3 points 1 and 2 are complete.** The playback pilot uses the selector and passed the desktop loopback checks. Point 3 adds viewer language settings and track selection. The owner provisionally accepted Milestone 2 for development and deferred the live Pi run. The Pi 5 flash image passed file-level verification. Physical boot and live-provider playback still need confirmation.
+**21 November 2026 · Milestone 3 points 1 through 3 are complete.** The desktop pilot passed the selector, loopback playback and profile language checks. Point 4 is next. The owner provisionally accepted Milestone 2 for development and deferred the live Pi run. The Pi 5 flash image passed file-level verification. Physical boot and live-provider playback still need confirmation.
 
 ## Start Milestone 3
 
@@ -67,6 +67,24 @@ Prefer verified matches during ranking. At token-matched AV start inspect the ac
 **Pilot configuration.** Open **Settings → Player → Language → Appliance playback** to set source quality and the independent Movies, TV and Anime preferences. The surrounding Kodi audio and subtitle settings supply the languages. The title context menu's **Playback language** action changes or clears a saved movie or series choice. An exhaustion alternative applies to the current play request.
 
 In `index.json`, a title can add `"originalLanguage":"ja"` and `"anime":true`. Old rows use ordinary Kodi tracks when the original language is unknown. Episodes can supply a shared provider-qualified `"seriesId":"tmdb:900000025"`. Without it, an indexed Kodi show with a TMDB ID supplies the key. Without either show ID, the choice is saved for that episode. Movie and series choices live under `special://profile/appliance/language/`. Kodi bookmarks still use each title's anchor. A local file object can provide complete, verified `audioLanguages` and `fullSubtitleLanguages` arrays. Include only full dialogue tracks in the subtitle array. Omit an array when its contents are unknown. Kodi checks the actual streams before accepting an opened file. The provisional stream-selection confirmation window is two seconds after applying the tracks.
+
+**Point 3 evidence, 21 November 2026.** Tested revision `dd2ad40135e33ce79db602948da5d0b5e2edebd7` on Ubuntu 24.04.5 x86-64. The build reused X11/OpenGL, system FFmpeg, testing enabled, LTO off and Release flags `-O0 -DNDEBUG`. Kodi ran under Xvfb with an ALSA null default PCM. The ALSA config loaded `/usr/share/alsa/alsa.conf` and set `pcm.!default { type null }`. The disposable profile used TCP port 19103 and the [M2 bookmark and Samba settings](#milestone-2-pilot-configuration-and-checks).
+
+```sh
+cmake --build /appliance-build --target kodi-test kodi-x11 -j 4
+/appliance-build/kodi-test --gtest_filter='TestAppliancePlayback.*'
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$primary" --port 19103 --language-phase first
+# Restart Kodi using the same userdata before checking the saved choice.
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$primary" --port 19103 --language-phase restart
+# Start Kodi on a fresh profile named "Language fixture second profile" in the same installation.
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$secondary" --port 19103 --language-phase second-profile
+# Start Kodi with fresh disposable userdata for the original loopback fixture.
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$baseline" --port 19103
+```
+
+All 10 focused tests and all fixture phases passed. Back canceled the Ask dialog with no provider connection or active player. Sub skipped a misleading source and selected Japanese audio with full English fallback subtitles when Spanish was available only as a forced track. The next episode reused the series choice, including after restart. The named second profile prompted for the same series. The title menu changed and cleared the series choice while preserving the saved movie choice. An anime film used its Anime default, Dub retained Kodi's ordinary subtitle behavior, and the exhaustion dialog allowed both declining and playing the offered Dub alternative.
+
+The original loopback fixture passed ordinary playback, local-first fallback with zero provider requests, alternate routes, expired-link refresh, cross-source resume and stale-response suppression. Silent SMB reached discovery in 10.049 seconds. These are desktop results. Point 4's next open question is how to distinguish a hard midstream failure from clean EOF and carry the accepted position into a replacement. Pi playback, track timing and performance remain open.
 
 #### 4. Drive replacement and resume from the cause of the event
 
