@@ -1,6 +1,6 @@
 # Engineering handoff
 
-**21 November 2026 · Milestone 3 points 1 through 3 are complete.** The desktop pilot passed the selector, loopback playback and profile language checks. Point 4 is next. The owner provisionally accepted Milestone 2 for development and deferred the live Pi run. The Pi 5 flash image passed file-level verification. Physical boot and live-provider playback still need confirmation.
+**21 November 2026 · Milestone 3 points 1 through 4 are complete on desktop.** The desktop pilot passed the selector, language, and source replacement checks. Point 5 is next. The owner provisionally accepted Milestone 2 for development and deferred the live Pi run. The Pi 5 flash image passed file-level verification. Physical boot and live-provider playback still need confirmation.
 
 ## Start Milestone 3
 
@@ -100,6 +100,30 @@ Extend the existing attempt in [Application.cpp](../../xbmc/application/Applicat
 | Exhaustion | End automatic work, show a concise reason and offer intentional Retry or manual selection of an eligible file. Back ends the request. A fresh search, if used, consumes the same budget and preserves exclusions. Count attempts and elapsed time, including in-flight provider timeouts. Use a monotonic retry deadline starting at failure/recovery so time spent successfully watching cannot exhaust it. Name provisional limits in code, allow the baseline silent-SMB case, and test count, deadline and cooldown boundaries without real sleeps. If a limit stops local retries, surface exhaustion before launching remote work. |
 
 Trace `CVideoPlayer::OnExit` through `OnPlayerCloseFile`, `OnPlaybackTerminated` and the resume read in `PlayFileInternal`. Close queues a bookmark before termination. Ensure a stale close or a rejected startup at position zero cannot erase newer progress. Carry the accepted position into a replacement when the title's original start offset or cached video tag is stale. Preserve normal Stop/EOF bookmark and play-count semantics and the untagged error-plus-stopped callbacks. Test a remote break after seeking, resume on a distinct file within the fixture's keyframe tolerance, then reopen the title after restart. Store only title bookmarks and stable file identities in persistent state. [VideoPlayer](../../xbmc/cores/VideoPlayer/VideoPlayer.cpp) · [FFmpeg demuxer](../../xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp) · [Player callbacks](../../xbmc/application/ApplicationPlayerCallback.cpp) · [Bookmark writer](../../xbmc/utils/SaveFileStateJob.cpp)
+
+**Pilot recovery behavior.** Estuary's video OSD offers **Try another source** after an appliance file starts. The action preserves the title bookmark and skips that file across its routes. Explicit Stop arms a two-minute replay window in the running process. A later resume prefers a last working eligible file within its tier. The profile's `appliance/working/` directory stores only a fingerprint of that file's stable identity. Kodi's video database stores the position on the title anchor.
+
+The provisional budget is 16 source attempts, counting each local open, discovery and remote resolution with its associated open. The 30-second recovery window starts at failure or an explicit source change. An accepted stream clears the deadline during normal viewing. A failed route cools down for five seconds in that profile. The exhaustion dialog offers **Retry** and any eligible manual choices still available from the current queue.
+
+**Point 4 evidence, 21 November 2026.** Tested revision `4ed331087278b402b7aad96da7d20b6d62b63bc5` on Ubuntu 24.04.5 x86-64 with the point 3 build flags, Xvfb and an ALSA null PCM. The pre-change build at `4c0bd5afa214444a8411687e2c48ff57996c1897` reported `Player.OnStop` with `end: true` after a loopback HTTP response broke following a seek to 15 seconds. The cache had lost the reported length during the broken transfer. The appliance path now brings terminal input errors through VideoPlayer's drain and writes the accepted title bookmark before replacing the source.
+
+```sh
+cmake --build /appliance-build --target kodi-test kodi-x11 -j 7
+# Use LF in the Linux build copy of the Windows-exported upstream read fixture.
+sed 's/\r$//' /work/xbmc/filesystem/test/reffile.txt > /appliance-build/xbmc/filesystem/test/reffile.txt
+cd /appliance-build
+./kodi-test --gtest_filter='TestAppliancePlayback.*:TestFile.Read'
+# Launch Kodi under Xvfb with the M2 bookmark and Samba settings and TCP port 19105.
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$recovery" --port 19105 --recovery-phase first
+# Restart Kodi with the same userdata.
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$recovery" --port 19105 --recovery-phase restart
+# Use the same language phases documented in point 3, with TCP port 19104.
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$baseline" --port 19104
+```
+
+All 14 focused tests passed, including the attempt and monotonic time boundaries, the exact Stop-window and cooldown edges, profile/title scoping, and preference after eligibility. In the synthetic playback run, the interrupted title resumed on a distinct file at 19 seconds, within 1.5 seconds of the outgoing bookmark. Kodi restarted and reopened that same last working file at 19 seconds. Both the ordinary and appliance clean EOF controls reported `end: true`. Arrow-key navigation reached the OSD action. Local-to-local, local-to-remote and remote-to-remote replacements retained progress without an intervening stopped event. The remote skip bypassed both routes to the same member. Quick Play advanced after explicit Stop. The local attempt cap stopped before discovery, manual selection reached a later local file, Back dismissed exhaustion, and intentional Retry opened a repaired local source.
+
+The language phases also verified that skipping the only dual-audio file removed it as a language alternative. The baseline observed local-first playback with no provider requests on a playable local copy, silent SMB fallback to discovery in 10.062 seconds, expired-link refresh, alternate routes and cooldown, and title resume in both directions. A duplicate Play started no second lookup. Stop during discovery and switching to an ordinary file prevented further provider requests. The next open question is how these transitions and the selector budget behave on the release Pi build and across the library entry points in point 5.
 
 #### 5. Run the acceptance checks and record the evidence
 
