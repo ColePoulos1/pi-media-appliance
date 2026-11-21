@@ -1028,7 +1028,7 @@ void PLAYLIST::CPlayListPlayer::OnApplicationMessage(KODI::MESSAGING::ThreadMess
 
     // A video Stop can also cancel a pending source lookup.
     if (appPlayer->IsPlaying() || stopVideo)
-      g_application.StopPlaying();
+      g_application.StopPlaying(stopVideo);
   }
   break;
 

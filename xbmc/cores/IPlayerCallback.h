@@ -48,6 +48,13 @@ public:
         break;
     }
   }
+  virtual void OnPlaybackTerminated(const CFileItem& file,
+                                    PlaybackTermination reason,
+                                    const CBookmark& bookmark)
+  {
+    OnPlayerCloseFile(file, bookmark);
+    OnPlaybackTerminated(file, reason);
+  }
   virtual void OnQueueNextItem() = 0;
   virtual void OnPlayBackSeek(int64_t iTime, int64_t seekOffset) {}
   virtual void OnPlayBackSeekChapter(int iChapter) {}

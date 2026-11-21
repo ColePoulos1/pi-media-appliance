@@ -141,7 +141,7 @@ static int PlayerControl(const std::vector<std::string>& params)
   }
   else if (paramlow == "stop")
   {
-    g_application.StopPlaying();
+    g_application.StopPlaying(true);
   }
   else if (StringUtils::StartsWithNoCase(params[0], "frameadvance"))
   {

@@ -26,6 +26,7 @@
 #include "profiles/ProfileManager.h"
 #include "settings/Settings.h"
 #include "settings/SettingsComponent.h"
+#include "utils/Digest.h"
 #include "utils/JSONVariantParser.h"
 #include "utils/LangCodeExpander.h"
 #include "utils/StringUtils.h"
@@ -103,20 +104,15 @@ LanguageChoice ReadChoice(const PlaybackLanguage& language)
   return LanguageChoice::Ordinary;
 }
 
-bool SaveChoice(const PlaybackLanguage& language, LanguageChoice choice)
+bool WriteState(const std::string& path, const std::string& value)
 {
-  const std::string path = ChoicePath(language);
-  if (choice == LanguageChoice::Ordinary)
-    return !XFILE::CFile::Exists(path) || XFILE::CFile::Delete(path);
-
-  XFILE::CDirectory::Create(std::string(ROOT) + "language");
+  XFILE::CDirectory::Create(URIUtils::GetDirectory(path));
   const auto target = std::filesystem::u8path(CSpecialProtocol::TranslatePath(path));
   const std::string pending = path + ".tmp";
   XFILE::CFile file;
-  const char value = choice == LanguageChoice::Sub ? 's' : 'd';
   if (!file.OpenForWrite(pending, true))
     return false;
-  const bool written = file.Write(&value, 1) == 1;
+  const bool written = file.Write(value.data(), value.size()) == static_cast<ssize_t>(value.size());
   file.Flush();
   file.Close();
   std::error_code error;
@@ -129,6 +125,14 @@ bool SaveChoice(const PlaybackLanguage& language, LanguageChoice choice)
     return false;
   }
   return true;
+}
+
+bool SaveChoice(const PlaybackLanguage& language, LanguageChoice choice)
+{
+  const std::string path = ChoicePath(language);
+  if (choice == LanguageChoice::Ordinary)
+    return !XFILE::CFile::Exists(path) || XFILE::CFile::Delete(path);
+  return WriteState(path, choice == LanguageChoice::Sub ? "s" : "d");
 }
 
 std::string LanguageName(const std::string& code)
@@ -185,9 +189,11 @@ bool IsHttp(const CURL& url)
          url.GetUserName().empty() && url.GetPassWord().empty() && url.GetProtocolOptions().empty();
 }
 
-CVariant GetJson(const std::string& url, const std::string& header = {})
+CVariant GetJson(const std::string& url,
+                 const std::atomic_bool& cancelled,
+                 const std::string& header = {})
 {
-  if (!IsHttp(CURL(url)) || header.find_first_of("\r\n") != std::string::npos)
+  if (cancelled || !IsHttp(CURL(url)) || header.find_first_of("\r\n") != std::string::npos)
     return {};
 
   // These requests contain account data and must bypass CCurlFile's URL and response logging.
@@ -217,6 +223,11 @@ CVariant GetJson(const std::string& url, const std::string& header = {})
   g_curlInterface.easy_setopt(curl.get(), CURLOPT_FAILONERROR, 1L);
   g_curlInterface.easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 2500L);
   g_curlInterface.easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 5000L);
+  const auto progress = +[](void* state, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int
+  { return *static_cast<const std::atomic_bool*>(state) ? 1 : 0; };
+  g_curlInterface.easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+  g_curlInterface.easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, progress);
+  g_curlInterface.easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &cancelled);
   g_curlInterface.easy_setopt(curl.get(), CURLOPT_WRITEDATA, &response);
   g_curlInterface.easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, receive);
 
@@ -568,6 +579,92 @@ bool ResolverRoute::operator<(const ResolverRoute& other) const
 {
   return std::tie(provider, torrentId, fileId) <
          std::tie(other.provider, other.torrentId, other.fileId);
+}
+
+void RetryBudget::Start(PlaybackClock::time_point now)
+{
+  deadline = std::min(deadline, now + RETRY_TIME);
+}
+
+bool RetryBudget::CanTry(PlaybackClock::time_point now) const
+{
+  return attempts < MAX_SOURCE_ATTEMPTS && now < deadline;
+}
+
+void PlaybackHistory::Stopped(int profile, const std::string& title, Stop stop)
+{
+  for (auto it = m_stops.begin(); it != m_stops.end();)
+    it = stop.time >= it->second.time + QUICK_REPLAY_WINDOW ? m_stops.erase(it) : std::next(it);
+  m_stops[{profile, title}] = std::move(stop);
+}
+
+void PlaybackHistory::Started(int profile, const std::string& title)
+{
+  m_stops.erase({profile, title});
+}
+
+const PlaybackHistory::Stop* PlaybackHistory::RecentStop(int profile,
+                                                        const std::string& title,
+                                                        PlaybackClock::time_point now)
+{
+  const auto stop = m_stops.find({profile, title});
+  if (stop != m_stops.end() && now < stop->second.time + QUICK_REPLAY_WINDOW)
+    return &stop->second;
+  return nullptr;
+}
+
+void PlaybackHistory::CoolRoute(int profile, const ResolverRoute& route, PlaybackClock::time_point now)
+{
+  for (auto it = m_cooldowns.begin(); it != m_cooldowns.end();)
+    it = now >= it->second ? m_cooldowns.erase(it) : std::next(it);
+  m_cooldowns[{profile, route}] = now + ROUTE_COOLDOWN;
+}
+
+bool PlaybackHistory::RouteCoolingDown(int profile,
+                                      const ResolverRoute& route,
+                                      PlaybackClock::time_point now)
+{
+  const auto cooldown = m_cooldowns.find({profile, route});
+  return cooldown != m_cooldowns.end() && now < cooldown->second;
+}
+
+std::string StableFileKey(const FileIdentity& identity)
+{
+  using KODI::UTILITY::CDigest;
+  const auto prefix = identity.tier == Tier::Local ? "local:" : "torrent:";
+  return CDigest::Calculate(CDigest::Type::SHA256,
+                           prefix + identity.torrentHash + ':' + identity.member);
+}
+
+std::string LastWorkingFile(const Title& title)
+{
+  std::string filename = title.key;
+  StringUtils::Replace(filename, ':', '-');
+  XFILE::CFile file;
+  std::string key(64, '\0');
+  if (file.Open(std::string(ROOT) + "working/" + filename) &&
+      file.GetLength() == static_cast<int64_t>(key.size()) &&
+      file.Read(key.data(), key.size()) == static_cast<ssize_t>(key.size()))
+    return key;
+  return {};
+}
+
+void RememberWorkingFile(const Title& title, const std::string& key)
+{
+  std::string filename = title.key;
+  StringUtils::Replace(filename, ':', '-');
+  if (!WriteState(std::string(ROOT) + "working/" + filename, key))
+    CLog::Log(LOGWARNING, "Appliance: could not save last working file");
+}
+
+void PreferWorkingFile(std::vector<RankedFile>& files, const std::string& key)
+{
+  if (key.empty())
+    return;
+  const auto match = std::find_if(files.begin(), files.end(), [&key](const RankedFile& file)
+                                  { return StableFileKey(file.file.identity) == key; });
+  if (match != files.end())
+    std::rotate(files.begin(), match, std::next(match));
 }
 
 FileSize FileSize::FromMemberBytes(const CVariant& value)
@@ -971,7 +1068,8 @@ CVariant SelectFile(const CVariant& files, const CVariant& entry)
 
 std::vector<FileCandidate> Discover(const CVariant& entry,
                                     const CVariant& providers,
-                                    const std::string& titleKey)
+                                    const std::string& titleKey,
+                                    const std::atomic_bool& cancelled)
 {
   const std::string fixture = providers["fixture"].asString();
   const std::string query = entry["query"].asString();
@@ -987,7 +1085,7 @@ std::vector<FileCandidate> Discover(const CVariant& entry,
   const CVariant releases =
       GetJson(prowlarr + "/api/v1/search?type=search&limit=" + std::to_string(RELEASE_LIMIT) +
                   "&query=" + CURL::Encode(query),
-              fixture.empty() ? "X-Api-Key: " + apiKey : std::string{});
+              cancelled, fixture.empty() ? "X-Api-Key: " + apiKey : std::string{});
   if (!releases.isArray())
     return {};
 
@@ -1012,7 +1110,7 @@ std::vector<FileCandidate> Discover(const CVariant& entry,
   const CVariant listing =
       GetJson((fixture.empty() ? TORBOX : fixture) + std::string(TORBOX_TORRENTS) +
                   "mylist?limit=" + std::to_string(TORRENT_LIMIT),
-              fixture.empty() ? "Authorization: Bearer " + torboxKey : std::string{});
+              cancelled, fixture.empty() ? "Authorization: Bearer " + torboxKey : std::string{});
   const CVariant& torrents = listing["data"];
   if (!listing["success"].asBoolean() || !torrents.isArray())
     return {};
@@ -1061,7 +1159,9 @@ std::vector<FileCandidate> Discover(const CVariant& entry,
   return candidates;
 }
 
-std::string Resolve(const CVariant& providers, const ResolverRoute& route)
+std::string Resolve(const CVariant& providers,
+                    const ResolverRoute& route,
+                    const std::atomic_bool& cancelled)
 {
   if (route.provider != TORBOX_PROVIDER || route.torrentId.empty() || route.fileId.empty())
     return {};
@@ -1074,7 +1174,8 @@ std::string Resolve(const CVariant& providers, const ResolverRoute& route)
   const CVariant response = GetJson(
       (fixture.empty() ? TORBOX : fixture) + std::string(TORBOX_TORRENTS) + "requestdl?" +
       (fixture.empty() ? "token=" + CURL::Encode(key) + "&" : std::string{}) +
-      "torrent_id=" + CURL::Encode(route.torrentId) + "&file_id=" + CURL::Encode(route.fileId));
+      "torrent_id=" + CURL::Encode(route.torrentId) + "&file_id=" + CURL::Encode(route.fileId),
+      cancelled);
   if (!response["success"].asBoolean())
     return {};
 

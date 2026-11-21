@@ -68,6 +68,7 @@ namespace XFILE
     int64_t m_seekPos = 0;
     int64_t m_readPos = 0;
     int64_t m_writePos = 0;
+    std::atomic_bool m_readFailed{false};
     unsigned m_chunkSize = 0;
     uint32_t m_writeRate = 0;
     uint32_t m_writeRateActual = 0;

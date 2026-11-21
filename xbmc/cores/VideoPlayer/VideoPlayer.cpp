@@ -59,6 +59,7 @@
 #include "utils/URIUtils.h"
 #include "utils/Variant.h"
 #include "utils/log.h"
+#include "video/AppliancePlayback.h"
 #include "video/Bookmark.h"
 #include "video/VideoInfoTag.h"
 #include "windowing/WinSystem.h"
@@ -724,6 +725,12 @@ bool CVideoPlayer::CloseFile(bool reopen)
   {
     CSingleExit exitlock(CServiceBroker::GetWinSystem()->GetGfxContext());
     StopThread();
+    if (m_item.HasProperty(KODI::APPLIANCE::SOURCE_TOKEN))
+    {
+      // A replacement uses the outgoing bookmark even if another caller still holds the player.
+      while (m_outboundEvents->IsProcessing())
+        CThread::Sleep(10ms);
+    }
   }
 
   m_Edl.Clear();
@@ -1563,6 +1570,8 @@ void CVideoPlayer::Process()
       if (!m_pInputStream->IsEOF())
         CLog::Log(LOGINFO, "{} - eof reading from demuxer", __FUNCTION__);
 
+      if (m_item.HasProperty(KODI::APPLIANCE::SOURCE_TOKEN) && m_pInputStream->HasReadError())
+        m_error = true;
       break;
     }
 
@@ -2563,9 +2572,9 @@ void CVideoPlayer::OnExit()
   }
   bookmark.player = m_name;
   bookmark.playerState = GetPlayerState();
-  m_outboundEvents->Submit([=]() {
-    cb->OnPlayerCloseFile(fileItem, bookmark);
-  });
+  const bool appliance = fileItem.HasProperty(KODI::APPLIANCE::SOURCE_TOKEN);
+  if (!appliance)
+    m_outboundEvents->Submit([=]() { cb->OnPlayerCloseFile(fileItem, bookmark); });
 
   // destroy objects
   m_renderManager.Flush(false, false);
@@ -2588,7 +2597,12 @@ void CVideoPlayer::OnExit()
   const auto reason = m_bCloseRequest ? PlaybackTermination::Stopped
                       : m_error       ? PlaybackTermination::Failed
                                       : PlaybackTermination::Ended;
-  m_outboundEvents->Submit([=]() { cb->OnPlaybackTerminated(fileItem, reason); });
+  m_outboundEvents->Submit([=]() {
+    if (appliance)
+      cb->OnPlaybackTerminated(fileItem, reason, bookmark);
+    else
+      cb->OnPlaybackTerminated(fileItem, reason);
+  });
 }
 
 void CVideoPlayer::HandleMessages()

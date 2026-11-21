@@ -611,22 +611,15 @@ ssize_t CFile::Read(void *lpBuf, size_t uiBufSize)
 
   if(m_pBuffer)
   {
-    if(m_flags & READ_TRUNCATED)
-    {
-      const ssize_t nBytes = m_pBuffer->sgetn(
-        (char *)lpBuf, std::min<std::streamsize>((std::streamsize)uiBufSize,
-                                                  m_pBuffer->in_avail()));
-      if (m_bitStreamStats && nBytes>0)
-        m_bitStreamStats->AddSampleBytes(nBytes);
-      return nBytes;
-    }
-    else
-    {
-      const ssize_t nBytes = m_pBuffer->sgetn((char*)lpBuf, uiBufSize);
-      if (m_bitStreamStats && nBytes>0)
-        m_bitStreamStats->AddSampleBytes(nBytes);
-      return nBytes;
-    }
+    const auto size = m_flags & READ_TRUNCATED
+                          ? std::min<std::streamsize>(uiBufSize, m_pBuffer->in_avail())
+                          : static_cast<std::streamsize>(uiBufSize);
+    const ssize_t nBytes = m_pBuffer->sgetn(static_cast<char*>(lpBuf), size);
+    if (m_bitStreamStats && nBytes > 0)
+      m_bitStreamStats->AddSampleBytes(nBytes);
+    if (nBytes == 0 && (m_flags & READ_REPORT_FAILURE) && m_pBuffer->HasReadError())
+      return -1;
+    return nBytes;
   }
 
   try
@@ -1125,6 +1118,7 @@ CFileStreamBuffer::int_type CFileStreamBuffer::underflow()
   }
 
   ssize_t size = m_file->Read(m_buffer+backsize, m_frontsize);
+  m_readError = size < 0;
 
   if (size == 0)
     return traits_type::eof();

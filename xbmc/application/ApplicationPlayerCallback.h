@@ -30,7 +30,9 @@ public:
   void OnPlayBackResumed() override;
   void OnPlayBackStopped() override;
   void OnPlayBackError() override;
-  void OnPlaybackTerminated(const CFileItem& file, PlaybackTermination reason) override;
+  void OnPlaybackTerminated(const CFileItem& file,
+                            PlaybackTermination reason,
+                            const CBookmark& bookmark) override;
   void OnQueueNextItem() override;
   void OnPlayBackSeek(int64_t iTime, int64_t seekOffset) override;
   void OnPlayBackSeekChapter(int iChapter) override;
@@ -41,5 +43,10 @@ public:
   void StoreVideoSettings(const CFileItem& fileItem, const CVideoSettings& vs) override;
 
 protected:
-  std::atomic<int64_t> m_verifiedLanguageSource{0};
+  std::atomic<int64_t> m_acceptedApplianceSource{0};
+  std::atomic<int64_t> m_replacingApplianceSource{0};
+  std::atomic<int64_t> m_closedAppliancePosition{0};
+
+private:
+  void SaveBookmark(const CFileItem& file, const CBookmark& bookmark, bool recovering);
 };

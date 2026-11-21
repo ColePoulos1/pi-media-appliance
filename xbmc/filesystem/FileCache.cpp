@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <inttypes.h>
 #include <memory>
 
@@ -133,7 +134,8 @@ bool CFileCache::Open(const CURL& url)
             "CFileCache::{} - <{}> source chunk size is {}, setting cache chunk size to {}",
             __FUNCTION__, m_sourcePath, m_source.GetChunkSize(), m_chunkSize);
 
-  m_fileSize = m_source.GetLength();
+  const int64_t length = m_source.GetLength();
+  m_fileSize = m_flags & READ_REPORT_FAILURE ? std::max<int64_t>(0, length) : length;
 
   if (!m_pCache)
   {
@@ -245,11 +247,14 @@ void CFileCache::Process()
 
   CWriteRate limiter;
   CWriteRate average;
+  const bool reportFailure = (m_flags & READ_REPORT_FAILURE) != 0;
 
   while (!m_bStop)
   {
-    // Update filesize
-    m_fileSize = m_source.GetLength();
+    // Some sources lose their reported length after a broken transfer.
+    const int64_t length = m_source.GetLength();
+    if (!reportFailure || length > 0)
+      m_fileSize = length;
 
     // check for seek events
     if (m_seekEvent.Wait(0ms))
@@ -374,6 +379,8 @@ void CFileCache::Process()
           CLog::Log(LOGDEBUG, "CFileCache::{} - <{}> source read hit eof", __FUNCTION__,
                     m_sourcePath);
 
+        if (reportFailure)
+          m_readFailed = iRead < 0 || (m_fileSize > 0 && m_writePos < m_fileSize);
         m_pCache->EndOfInput();
 
         // The thread event will now also cause the wait of an event to return a false.
@@ -388,6 +395,8 @@ void CFileCache::Process()
       }
     }
 
+    if (reportFailure && iRead > 0)
+      m_readFailed = false;
     int iTotalWrite = 0;
     while (!m_bStop && (iTotalWrite < iRead))
     {
@@ -501,11 +510,20 @@ retry:
   {
     CLog::Log(LOGWARNING, "CFileCache::{} - <{}> timeout waiting for data", __FUNCTION__,
               m_sourcePath);
-    return -1;
+    return m_flags & READ_REPORT_FAILURE ? -EAGAIN : -1;
   }
 
   if (iRc == 0)
+  {
+    if (m_flags & READ_REPORT_FAILURE)
+    {
+      if (!m_pCache->IsEndOfInput())
+        return -EAGAIN;
+      if (m_readFailed)
+        return -1;
+    }
     return 0;
+  }
 
   // unknown error code
   CLog::Log(LOGERROR, "CFileCache::{} - <{}> cache strategy returned unknown error code {}",

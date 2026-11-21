@@ -43,6 +43,8 @@ namespace XFILE
 /* indicate that caller want open a file without intermediate buffer regardless to file type */
   static const unsigned int READ_NO_BUFFER = 0x200;
 
+  static const unsigned int READ_REPORT_FAILURE = 0x400;
+
 struct SNativeIoControl
 {
   unsigned long int   request;

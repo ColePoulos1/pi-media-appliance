@@ -30,6 +30,71 @@ FileCandidate Remote(const TitleContext& title, char hashDigit, FileSize size)
 }
 } // namespace
 
+TEST(TestAppliancePlayback, BoundsRecoveryByAttemptsAndMonotonicTime)
+{
+  const PlaybackClock::time_point opened{};
+  RetryBudget budget;
+  EXPECT_TRUE(budget.CanTry(opened + 3h));
+  const auto failed = opened + 3h;
+  budget.Start(failed);
+  budget.Start(failed + 10s);
+  EXPECT_TRUE(budget.CanTry(failed + RETRY_TIME - 1ms));
+  EXPECT_FALSE(budget.CanTry(failed + RETRY_TIME));
+  budget.attempts = MAX_SOURCE_ATTEMPTS - 1;
+  EXPECT_TRUE(budget.CanTry(failed));
+  ++budget.attempts;
+  EXPECT_FALSE(budget.CanTry(failed));
+}
+
+TEST(TestAppliancePlayback, ScopesQuickReplayAndCooldown)
+{
+  const PlaybackClock::time_point stopped{};
+  PlaybackHistory history;
+  const FileIdentity file{Tier::Local, {}, "synthetic.mkv"};
+  history.Stopped(1, "movie", {stopped, file, 15000});
+  const auto* recent = history.RecentStop(1, "movie", stopped + QUICK_REPLAY_WINDOW - 1ms);
+  ASSERT_NE(recent, nullptr);
+  EXPECT_EQ(recent->file.member, file.member);
+  EXPECT_EQ(recent->position, 15000);
+  EXPECT_EQ(history.RecentStop(1, "movie", stopped + QUICK_REPLAY_WINDOW), nullptr);
+  EXPECT_EQ(history.RecentStop(1, "episode", stopped), nullptr);
+  EXPECT_EQ(history.RecentStop(2, "movie", stopped), nullptr);
+  history.Started(1, "movie");
+  EXPECT_EQ(history.RecentStop(1, "movie", stopped), nullptr);
+
+  const ResolverRoute route{"torbox", "11", "4"};
+  history.CoolRoute(1, route, stopped);
+  EXPECT_TRUE(history.RouteCoolingDown(1, route, stopped + ROUTE_COOLDOWN - 1ms));
+  EXPECT_FALSE(history.RouteCoolingDown(1, route, stopped + ROUTE_COOLDOWN));
+  EXPECT_FALSE(history.RouteCoolingDown(2, route, stopped));
+  EXPECT_FALSE(history.RouteCoolingDown(1, {"torbox", "11", "7"}, stopped));
+}
+
+TEST(TestAppliancePlayback, PrefersLastWorkingFileOnlyAfterEligibility)
+{
+  const TitleContext title{"episode:tmdb:900000002", 40min};
+  auto first = Remote(title, 'a', {SizeKind::Exact, 2400000000});
+  auto second = Remote(title, 'b', {SizeKind::Exact, 1200000000});
+  auto local = first;
+  local.identity = {Tier::Local, {}, "local.mkv"};
+  SelectionPreferences preferences;
+  auto remote = RankFiles({first, second}, title, preferences, {});
+  ASSERT_EQ(remote.size(), 2u);
+  EXPECT_EQ(remote.front().file.identity.torrentHash, first.identity.torrentHash);
+  const auto preferred = StableFileKey(second.identity);
+  PreferWorkingFile(remote, preferred);
+  EXPECT_EQ(remote.front().file.identity.torrentHash, second.identity.torrentHash);
+  auto locals = RankFiles({local}, title, preferences, {});
+  PreferWorkingFile(locals, preferred);
+  ASSERT_EQ(locals.size(), 1u);
+  EXPECT_EQ(locals.front().file.identity.member, local.identity.member);
+  preferences.skipped.insert(second.identity);
+  remote = RankFiles({first, second}, title, preferences, {});
+  PreferWorkingFile(remote, preferred);
+  ASSERT_EQ(remote.size(), 1u);
+  EXPECT_EQ(remote.front().file.identity.torrentHash, first.identity.torrentHash);
+}
+
 TEST(TestAppliancePlayback, PrefersCredibleMovieEncodeInBalancedAndHighQuality)
 {
   const TitleContext movie{"movie:tmdb:900000001", 7200s};

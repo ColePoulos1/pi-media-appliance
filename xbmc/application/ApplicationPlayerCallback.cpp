@@ -13,6 +13,7 @@
 #include "PlayListPlayer.h"
 #include "ServiceBroker.h"
 #include "URL.h"
+#include "Util.h"
 #include "application/ApplicationComponents.h"
 #include "application/ApplicationPlayer.h"
 #include "application/ApplicationStackHelper.h"
@@ -35,6 +36,7 @@
 #include "video/VideoDatabase.h"
 #include "video/VideoInfoTag.h"
 
+#include <cmath>
 #include <memory>
 
 CApplicationPlayerCallback::CApplicationPlayerCallback()
@@ -98,10 +100,16 @@ void CApplicationPlayerCallback::OnPlayBackStarted(const CFileItem& file)
 void CApplicationPlayerCallback::OnPlayerCloseFile(const CFileItem& file,
                                                    const CBookmark& bookmarkParam)
 {
-  if (file.HasProperty(KODI::APPLIANCE::LANGUAGE_CHOICE) &&
-      file.GetProperty(KODI::APPLIANCE::SOURCE_TOKEN).asInteger() != m_verifiedLanguageSource)
+  const auto token = file.GetProperty(KODI::APPLIANCE::SOURCE_TOKEN).asInteger();
+  if (token && token != m_acceptedApplianceSource)
     return;
+  SaveBookmark(file, bookmarkParam, false);
+}
 
+void CApplicationPlayerCallback::SaveBookmark(const CFileItem& file,
+                                              const CBookmark& bookmarkParam,
+                                              bool recovering)
+{
   auto& components = CServiceBroker::GetAppComponents();
   const auto stackHelper = components.GetComponent<CApplicationStackHelper>();
 
@@ -136,18 +144,21 @@ void CApplicationPlayerCallback::OnPlayerCloseFile(const CFileItem& file,
   const std::shared_ptr<CAdvancedSettings> advancedSettings =
       CServiceBroker::GetSettingsComponent()->GetAdvancedSettings();
 
-  if ((fileItem.IsAudio() && advancedSettings->m_audioPlayCountMinimumPercent > 0 &&
-       percent >= advancedSettings->m_audioPlayCountMinimumPercent) ||
-      (fileItem.IsVideo() && advancedSettings->m_videoPlayCountMinimumPercent > 0 &&
-       percent >= advancedSettings->m_videoPlayCountMinimumPercent))
+  if (!recovering &&
+      ((fileItem.IsAudio() && advancedSettings->m_audioPlayCountMinimumPercent > 0 &&
+        percent >= advancedSettings->m_audioPlayCountMinimumPercent) ||
+       (fileItem.IsVideo() && advancedSettings->m_videoPlayCountMinimumPercent > 0 &&
+        percent >= advancedSettings->m_videoPlayCountMinimumPercent)))
   {
     playCountUpdate = true;
   }
 
-  if (advancedSettings->m_videoIgnorePercentAtEnd > 0 &&
-      bookmark.totalTimeInSeconds - bookmark.timeInSeconds <
-          0.01 * static_cast<double>(advancedSettings->m_videoIgnorePercentAtEnd) *
-              bookmark.totalTimeInSeconds)
+  if (recovering)
+    resumeBookmark = bookmark;
+  else if (advancedSettings->m_videoIgnorePercentAtEnd > 0 &&
+           bookmark.totalTimeInSeconds - bookmark.timeInSeconds <
+               0.01 * static_cast<double>(advancedSettings->m_videoIgnorePercentAtEnd) *
+                   bookmark.totalTimeInSeconds)
   {
     resumeBookmark.timeInSeconds = -1.0;
   }
@@ -213,13 +224,22 @@ void CApplicationPlayerCallback::OnPlayBackError()
 }
 
 void CApplicationPlayerCallback::OnPlaybackTerminated(const CFileItem& file,
-                                                     PlaybackTermination reason)
+                                                      PlaybackTermination reason,
+                                                      const CBookmark& bookmark)
 {
   const int64_t token = file.GetProperty(KODI::APPLIANCE::SOURCE_TOKEN).asInteger();
   if (!token)
   {
-    IPlayerCallback::OnPlaybackTerminated(file, reason);
+    IPlayerCallback::OnPlaybackTerminated(file, reason, bookmark);
     return;
+  }
+
+  if (token == m_acceptedApplianceSource)
+  {
+    if (std::isfinite(bookmark.timeInSeconds) && bookmark.timeInSeconds > 0)
+      m_closedAppliancePosition = CUtil::ConvertSecsToMilliSecs(bookmark.timeInSeconds);
+    SaveBookmark(file, bookmark,
+                 reason == PlaybackTermination::Failed || token == m_replacingApplianceSource);
   }
 
   CGUIMessage msg(GUI_MSG_APPLIANCE_SOURCE_TERMINATED, 0, 0, token, static_cast<int>(reason));

@@ -3,6 +3,7 @@
 import argparse
 import json
 import socket
+import sqlite3
 import subprocess
 import tempfile
 from collections import Counter
@@ -84,8 +85,11 @@ class Provider(BaseHTTPRequestHandler):
             self.server.resolved_routes.append(route)
             assert route in {(11, 4), (12, 7), (20, 4)}, route
             expires = route == (11, 4) and (
-                self.server.mode == "alternate" or self.server.calls["resolve"] == 1)
+                self.server.mode == "alternate" or
+                (self.server.mode == "refresh" and self.server.calls["resolve"] == 1))
             source = "expired.mkv" if expires else "playing.mkv"
+            if self.server.mode == "break" and route[0] != 20:
+                source = "breaking.mp4"
             if self.server.mode == "next-file" and route[0] != 20:
                 reply = {"success": False}
             else:
@@ -95,10 +99,12 @@ class Provider(BaseHTTPRequestHandler):
         elif url.path == "/expired.mkv":
             self.server.calls["expired"] += 1
             self.reply(403, b"expired", "text/plain")
-        elif url.path == "/playing.mkv":
+        elif url.path in ("/playing.mkv", "/breaking.mp4"):
             self.server.calls["playing"] += 1
             body = self.server.media
             byte_range = self.headers.get("Range", "")
+            start, end = 0, len(body) - 1
+            headers = [("Accept-Ranges", "bytes")]
             if byte_range.startswith("bytes="):
                 from_byte, _, through_byte = byte_range[6:].partition("-")
                 start = int(from_byte)
@@ -107,10 +113,23 @@ class Provider(BaseHTTPRequestHandler):
                     return
                 end = min(int(through_byte) if through_byte else len(body) - 1, len(body) - 1)
                 extent = f"bytes {start}-{end}/{len(body)}"
-                self.reply(206, body[start : end + 1], "video/x-matroska",
-                           [("Content-Range", extent), ("Accept-Ranges", "bytes")])
+                headers.append(("Content-Range", extent))
+            status = 206 if byte_range.startswith("bytes=") else 200
+            if url.path == "/breaking.mp4":
+                self.send_response(status)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(end - start + 1))
+                for name, value in headers:
+                    self.send_header(name, value)
+                self.end_headers()
+                if self.command == "GET":
+                    try:
+                        self.wfile.write(body[start : min(end + 1, len(body) * 3 // 5)])
+                        self.server.break_read.wait(20)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
             else:
-                self.reply(200, body, "video/x-matroska", [("Accept-Ranges", "bytes")])
+                self.reply(status, body[start : end + 1], "video/x-matroska", headers)
         else:
             self.reply(404, b"", "text/plain")
 
@@ -172,6 +191,43 @@ class Kodi(KodiConnection):
     def start(self):
         return self.wait_for("Player.OnAVStart")["player"]["playerid"]
 
+    def replacement(self, timeout=10):
+        for message in self.messages(timeout):
+            event = message.get("method")
+            if event == "Player.OnStop":
+                raise AssertionError(f"Replacement stopped playback: {message['params']['data']}")
+            if event == "Player.OnAVStart":
+                return message["params"]["data"]["player"]["playerid"]
+
+    def seek(self, player_id, seconds):
+        self.request("Player.Seek", playerid=player_id, value={"time": {"seconds": seconds}})
+        self.wait_for("Player.OnSeek")
+        self.wait_until(lambda: abs(self.position(player_id) - seconds) <= 1)
+
+    def position(self, player_id):
+        value = self.call("Player.GetProperties", playerid=player_id, properties=["time"])["time"]
+        return value["minutes"] * 60 + value["seconds"]
+
+    def width(self, player_id):
+        return self.call("Player.GetProperties", playerid=player_id,
+                         properties=["currentvideostream"])["currentvideostream"]["width"]
+
+    def select_another(self):
+        self.call("Input.ExecuteAction", action="osd")
+        self.wait_until(lambda: self.window() == 12901)
+        focused = "Control.HasFocus(70049)"
+        for _ in range(14):
+            if self.call("XBMC.GetInfoBooleans", booleans=[focused])[focused]:
+                self.call("Input.Select")
+                return
+            self.call("Input.Right")
+            sleep(0.08)
+        raise AssertionError("Could not reach Try another source with the arrow keys")
+
+    def try_another(self):
+        self.select_another()
+        return self.replacement()
+
     def tracks(self, player_id, audio, width, subtitle=None):
         def selected():
             props = self.call("Player.GetProperties", playerid=player_id,
@@ -213,20 +269,24 @@ def language_check(userdata, port, phase):
     next_episode = library / "episode-tmdb-900000022.s01e02.mkv"
     anime_movie = library / "movie-tmdb-900000023.mkv"
     dub_only = library / "movie-tmdb-900000024.mkv"
+    only_dual = library / "movie-tmdb-900000026.mkv"
     dual = root / "fixtures" / "dual.mkv"
     misleading = root / "fixtures" / "JPN-full-subs.mkv"
     if phase in ("first", "second-profile"):
         named.mkdir(parents=True)
-        for path in (first, next_episode, anime_movie, dub_only):
+        for path in (first, next_episode, anime_movie, dub_only, only_dual):
             path.touch()
         make_language_media(dual.parent)
+        alternate = dual.with_name("dual-alternate.mkv")
+        alternate.write_bytes(dual.read_bytes())
         series = {"seriesId": "tmdb:900000025", "originalLanguage": "ja-JP",
                   "local": [str(misleading), str(dual)]}
         write_json(root / "index.json", {
             "episode:tmdb:900000021": dict(series, episode="s01e01", query="Pilot Show"),
             "episode:tmdb:900000022": dict(series, episode="s01e02"),
-            "movie:tmdb:900000023": dict(series, anime=True, local=[str(dual)]),
+            "movie:tmdb:900000023": dict(series, anime=True, local=[str(dual), str(alternate)]),
             "movie:tmdb:900000024": dict(series, local=[str(misleading)]),
+            "movie:tmdb:900000026": dict(series, anime=True, local=[str(dual)]),
         })
 
     with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
@@ -301,6 +361,15 @@ def language_check(userdata, port, phase):
         kodi.tracks(player, "eng", 240)
         assert kodi.call("Player.GetProperties", playerid=player, properties=subtitle_properties) == ordinary
         kodi.stop(player)
+        player = kodi.play(only_dual)
+        kodi.tracks(player, "eng", 240)
+        kodi.select_another()
+        kodi.wait_until(lambda: kodi.window() == 12000)
+        heading = "Control.GetLabel(1)"
+        kodi.wait_until(lambda: kodi.call("XBMC.GetInfoLabels", labels=[heading])[heading]
+                        == "No playable source supplied the requested tracks.")
+        kodi.call("Input.Back")
+        kodi.wait_until(lambda: kodi.window() != 12000)
         for accept in (False, True):
             kodi.call("Player.Open", item={"file": str(dub_only)})
             kodi.wait_until(lambda: kodi.window() == 12000)
@@ -367,6 +436,151 @@ def language_check(userdata, port, phase):
         kodi.tracks(player, "jpn", 240, "eng")
         kodi.stop(player)
         print("Changed and cleared the series choice from the title context menu")
+
+
+def recovery_check(userdata, port, phase):
+    root = userdata / "appliance"
+    library = root / "library"
+    episode = library / "episode-tmdb-900000002.s01e02.mkv"
+    entry = {"title": "Return", "episode": "s01e02", "query": "Pilot Show", "runtimeSeconds": 40}
+    index = {"episode:tmdb:900000002": entry}
+    if phase == "first":
+        library.mkdir(parents=True)
+        episode.touch()
+        write_json(root / "index.json", index)
+    with tempfile.TemporaryDirectory() as folder, ThreadingHTTPServer(
+            ("127.0.0.1", 0), Provider) as provider:
+        media = Path(folder) / "test.mp4"
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                        "-i", "testsrc2=size=240x136:rate=10", "-t", "40", "-c:v", "mpeg4",
+                        "-g", "10", "-movflags", "+faststart", str(media)], check=True)
+        provider.media = media.read_bytes()
+        provider.calls = Counter()
+        provider.resolved_routes = []
+        provider.mode = "break" if phase == "first" else "clean"
+        provider.break_read = Event()
+        provider.discovery_started = Event()
+        provider.discovery_replied = Event()
+        provider.release_discovery = Event()
+        provider.release_discovery.set()
+        write_json(root / "providers.json", {"fixture": f"http://127.0.0.1:{provider.server_port}"})
+        Thread(target=provider.serve_forever, daemon=True).start()
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+                kodi = Kodi(connection)
+                if phase == "restart":
+                    player_id = kodi.play(episode, resume=True)
+                    position = kodi.position(player_id)
+                    assert 14 <= position <= 26, position
+                    database, = (userdata / "Database").glob("MyVideos*.db")
+                    with sqlite3.connect(database) as db:
+                        saved, = db.execute(
+                            "SELECT timeInSeconds FROM bookmark JOIN files USING (idFile) "
+                            "WHERE strFilename = ? AND type = 1", (episode.name,)
+                        ).fetchone()
+                    assert abs(position - saved) <= 1.5, (position, saved)
+                    assert provider.resolved_routes == [(20, 4)], provider.resolved_routes
+                    kodi.seek(player_id, 38)
+                    assert kodi.wait_for("Player.OnStop")["end"] is True
+                    assert provider.resolved_routes == [(20, 4)], provider.resolved_routes
+                    print(f"Restart preferred the last working file at {position}s. Clean EOF ended.")
+                else:
+                    player_id = kodi.play(media)
+                    kodi.call("Input.ExecuteAction", action="osd")
+                    kodi.wait_until(lambda: kodi.window() == 12901)
+                    visible = "Control.IsVisible(70049)"
+                    assert not kodi.call("XBMC.GetInfoBooleans", booleans=[visible])[visible]
+                    kodi.call("Input.Back")
+                    kodi.wait_until(lambda: kodi.window() != 12901)
+                    kodi.seek(player_id, 38)
+                    assert kodi.wait_for("Player.OnStop")["end"] is True
+                    assert not provider.calls
+                    player_id = kodi.play(episode)
+                    kodi.seek(player_id, 15)
+                    provider.break_read.set()
+                    player_id = kodi.replacement(35)
+                    position = kodi.position(player_id)
+                    assert 14 <= position <= 26, position
+                    assert provider.resolved_routes == [(11, 4), (20, 4)], provider.resolved_routes
+                    kodi.stop(player_id)
+                    print(f"Hard HTTP read failure resumed a distinct file at {position}s.")
+                    return
+
+                # Exercise OSD and quick replay on a separate title with its own bookmark.
+                provider.mode = "clean"
+                provider.resolved_routes.clear()
+                alternate = library / "episode-tmdb-900000012.s01e02.mkv"
+                alternate.touch()
+                local = Path(folder) / "local.mkv"
+                subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                                "-i", "color=size=160x90:rate=10", "-t", "40",
+                                "-c:v", "mpeg4", "-g", "10", str(local)], check=True)
+                index["episode:tmdb:900000012"] = dict(entry, local=[str(local), str(media)])
+                write_json(root / "index.json", index)
+                player_id = kodi.play(alternate)
+                assert kodi.width(player_id) == 160
+                kodi.seek(player_id, 14)
+                player_id = kodi.try_another()
+                assert kodi.width(player_id) == 240
+                assert abs(kodi.position(player_id) - 14) <= 2
+                assert not provider.resolved_routes
+                player_id = kodi.try_another()
+                assert provider.resolved_routes == [(11, 4)], provider.resolved_routes
+                player_id = kodi.try_another()
+                assert provider.resolved_routes == [(11, 4), (20, 4)], provider.resolved_routes
+                kodi.stop(player_id)
+                player_id = kodi.play(alternate)
+                assert kodi.width(player_id) == 160
+                assert abs(kodi.position(player_id) - 14) <= 3
+                kodi.stop(player_id)
+                player_id = kodi.play(alternate)
+                assert kodi.width(player_id) == 240
+                assert abs(kodi.position(player_id) - 14) <= 3
+                kodi.stop(player_id)
+                print("OSD replaced local and remote sources. Quick Play skipped the stopped file.")
+
+                capped = library / "episode-tmdb-900000013.s01e02.mkv"
+                capped.touch()
+                missing = [str(Path(folder) / f"missing-{i}.mkv") for i in range(17)]
+                index["episode:tmdb:900000013"] = dict(entry, local=missing + [str(local)])
+                write_json(root / "index.json", index)
+                counts = provider.calls.copy()
+                kodi.call("Player.Open", item={"file": str(capped)})
+                kodi.wait_until(lambda: kodi.window() == 12000)
+                assert kodi.call("Player.GetActivePlayers") == []
+                assert provider.calls == counts
+                # Retry is the first row, the final playable local is the third.
+                kodi.call("Input.Down")
+                sleep(0.1)
+                kodi.call("Input.Down")
+                sleep(0.1)
+                kodi.request("Input.Select")
+                player_id = kodi.start()
+                assert kodi.width(player_id) == 160
+                kodi.stop(player_id)
+                assert provider.calls == counts
+                print("The attempt cap stopped before discovery, and manual local selection worked.")
+
+                retry = library / "movie-tmdb-900000014.mkv"
+                retry.touch()
+                repaired = Path(folder) / "repaired.mkv"
+                index["movie:tmdb:900000014"] = {"local": [str(repaired)]}
+                write_json(root / "index.json", index)
+                kodi.call("Player.Open", item={"file": str(retry)})
+                kodi.wait_until(lambda: kodi.window() == 12000)
+                kodi.call("Input.Back")
+                kodi.wait_until(lambda: kodi.window() != 12000)
+                assert kodi.call("Player.GetActivePlayers") == []
+                kodi.call("Player.Open", item={"file": str(retry)})
+                kodi.wait_until(lambda: kodi.window() == 12000)
+                repaired.write_bytes(local.read_bytes())
+                kodi.request("Input.Select")
+                player_id = kodi.start()
+                kodi.stop(player_id)
+                print("Back ended exhaustion. Intentional Retry opened a repaired local source.")
+        finally:
+            provider.break_read.set()
+            provider.shutdown()
 
 
 def run(userdata, port):
@@ -454,6 +668,7 @@ def run(userdata, port):
                     assert provider.resolved_routes == [(11, 4), (11, 4)], provider.resolved_routes
                     assert provider.calls["expired"] >= 1, provider.calls
                     assert provider.calls["playing"] >= 1, provider.calls
+                    kodi.wait_until(lambda: kodi.position(player_id) >= 14)
                     kodi.stop(player_id)
                     print(f"Silent SMB connection to discovery in {discovery_delay:.3f}s", flush=True)
 
@@ -472,32 +687,49 @@ def run(userdata, port):
                     index["episode:tmdb:900000002"]["local"] = [str(Path(folder) / "missing.mkv")]
                     write_json(root / "index.json", index)
                     for mode, expected in (("alternate", [(11, 4), (11, 4), (12, 7)]),
-                                           ("next-file", [(11, 4), (12, 7), (20, 4)])):
+                                           ("next-file", [(12, 7), (20, 4)])):
                         provider.mode = mode
                         provider.resolved_routes.clear()
                         discovered = provider.calls["discover"]
                         listed = provider.calls["list"]
-                        kodi.stop(kodi.play(episode))
+                        player_id = kodi.play(episode)
+                        if mode == "alternate":
+                            kodi.stop(kodi.play(local))
+                        else:
+                            kodi.stop(player_id)
                         assert provider.calls["discover"] == discovered + 1, provider.calls
                         assert provider.calls["list"] == listed + 1, provider.calls
                         assert provider.resolved_routes == expected, provider.resolved_routes
-                    print("Missing local, alternate route and next ranked file passed")
+                    print("Missing local, alternate route, cooldown, and next eligible file passed")
 
                     index["episode:tmdb:900000002"]["local"] = []
                     write_json(root / "index.json", index)
-                    provider.discovery_started.clear()
-                    provider.release_discovery.clear()
-                    provider.discovery_replied.clear()
-                    resolved = provider.calls["resolve"]
-                    kodi.call("Player.Open", item={"file": str(episode)})
-                    assert provider.discovery_started.wait(3)
-                    player_id = kodi.play(movie)
-                    provider.release_discovery.set()
-                    assert provider.discovery_replied.wait(3)
-                    sleep(0.25)
-                    assert provider.calls["resolve"] == resolved, provider.calls
-                    kodi.stop(player_id)
-                    print("A late discovery response left the replacement playback alone")
+                    for cancel in ("stop", "replace"):
+                        provider.discovery_started.clear()
+                        provider.release_discovery.clear()
+                        provider.discovery_replied.clear()
+                        discovered = provider.calls["discover"]
+                        resolved = provider.calls["resolve"]
+                        listed = provider.calls["list"]
+                        kodi.call("Player.Open", item={"file": str(episode)})
+                        assert provider.discovery_started.wait(3)
+                        if cancel == "stop":
+                            kodi.call("Player.Open", item={"file": str(episode)})
+                            kodi.call("Input.ExecuteAction", action="stop")
+                            sleep(0.25)
+                        else:
+                            player_id = kodi.play(local)
+                        provider.release_discovery.set()
+                        assert provider.discovery_replied.wait(3)
+                        sleep(0.25)
+                        assert provider.calls["resolve"] == resolved, provider.calls
+                        assert provider.calls["list"] == listed, provider.calls
+                        assert provider.calls["discover"] == discovered + 1, provider.calls
+                        if cancel == "replace":
+                            kodi.stop(player_id)
+                        else:
+                            assert kodi.call("Player.GetActivePlayers") == []
+                    print("Duplicate Play, Stop during discovery and switch to ordinary playback passed")
             finally:
                 provider.shutdown()
 
@@ -507,9 +739,12 @@ if __name__ == "__main__":
     parser.add_argument("userdata", type=Path, help="userdata folder of an isolated Kodi profile")
     parser.add_argument("--port", type=int, default=19090)
     parser.add_argument("--language-phase", choices=["first", "restart", "second-profile"])
+    parser.add_argument("--recovery-phase", choices=["first", "restart"])
     args = parser.parse_args()
     userdata = args.userdata.resolve(strict=True)
     if args.language_phase:
         language_check(userdata, args.port, args.language_phase)
+    elif args.recovery_phase:
+        recovery_check(userdata, args.port, args.recovery_phase)
     else:
         run(userdata, args.port)

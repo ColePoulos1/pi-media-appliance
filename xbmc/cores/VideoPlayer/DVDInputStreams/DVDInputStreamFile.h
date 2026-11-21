@@ -20,6 +20,7 @@ public:
   int Read(uint8_t* buf, int buf_size) override;
   int64_t Seek(int64_t offset, int whence) override;
   bool IsEOF() override;
+  bool HasReadError() const override { return m_readError; }
   int64_t GetLength() override;
   BitstreamStats GetBitstreamStats() const override ;
   int GetBlockSize() override;
@@ -29,5 +30,6 @@ public:
 protected:
   XFILE::CFile* m_pFile = nullptr;
   bool m_eof = false;
+  bool m_readError{false};
   unsigned int m_flags = 0;
 };

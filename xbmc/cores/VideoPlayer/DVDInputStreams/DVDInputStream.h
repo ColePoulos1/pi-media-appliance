@@ -188,6 +188,7 @@ public:
 
   bool IsStreamType(DVDStreamType type) const { return m_streamType == type; }
   virtual bool IsEOF() = 0;
+  virtual bool HasReadError() const { return false; }
   virtual BitstreamStats GetBitstreamStats() const { return m_stats; }
 
   bool ContentLookup() { return m_contentLookup; }

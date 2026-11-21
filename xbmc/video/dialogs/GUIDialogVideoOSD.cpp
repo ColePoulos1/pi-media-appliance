@@ -24,6 +24,8 @@
 using namespace KODI;
 using namespace PVR;
 
+constexpr int CONTROL_TRY_ANOTHER_SOURCE = 70049;
+
 CGUIDialogVideoOSD::CGUIDialogVideoOSD(void)
     : CGUIDialog(WINDOW_DIALOG_VIDEO_OSD, "VideoOSD.xml")
 {
@@ -81,6 +83,18 @@ bool CGUIDialogVideoOSD::OnMessage(CGUIMessage& message)
 {
   switch ( message.GetMessage() )
   {
+  case GUI_MSG_WINDOW_INIT:
+    SetProperty("ApplianceSource", g_application.CanTryAnotherApplianceSource() ? "true" : "");
+    break;
+  case GUI_MSG_CLICKED:
+    if (message.GetSenderId() == CONTROL_TRY_ANOTHER_SOURCE &&
+        g_application.CanTryAnotherApplianceSource())
+    {
+      Close(true);
+      g_application.TryAnotherApplianceSource();
+      return true;
+    }
+    break;
   case GUI_MSG_VIDEO_MENU_STARTED:
     {
       // We have gone to the DVD menu, so close the OSD.

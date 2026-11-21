@@ -43,6 +43,11 @@ class CSettingsComponent;
 class CSplash;
 class CWinSystemBase;
 
+namespace KODI::APPLIANCE
+{
+class PlaybackHistory;
+}
+
 namespace ADDON
 {
   class CSkinInfo;
@@ -130,7 +135,9 @@ public:
                                PLAYLIST::Id playlistId,
                                int track = 0);
   bool PlayFile(CFileItem item, const std::string& player, bool bRestart = false);
-  void StopPlaying();
+  void StopPlaying(bool explicitStop = false);
+  bool CanTryAnotherApplianceSource() const;
+  void TryAnotherApplianceSource();
   void Restart(bool bSamePosition = true);
   void DelayedPlayerRestart();
   void CheckDelayedPlayerRestart();
@@ -247,6 +254,10 @@ private:
   bool OpenApplianceSource(const std::string& path);
   void CheckApplianceTracks();
   void RejectApplianceTracks();
+  void AcceptApplianceSource();
+  int64_t CloseApplianceSource();
+  void ShowApplianceExhaustion();
+  void FailApplianceSource(bool refreshLink);
   void AnnouncePlaybackAVStart();
   void CancelAppliancePlayback();
   void PrintStartupLog();
@@ -261,6 +272,7 @@ private:
   int m_ExitCode{EXITCODE_QUIT};
   std::shared_ptr<CFileItem> m_itemCurrentFile; //!< Currently playing file
   std::shared_ptr<AppliancePlayback> m_appliancePlayback;
+  std::unique_ptr<KODI::APPLIANCE::PlaybackHistory> m_applianceHistory;
   int64_t m_applianceSerial{0};
   int64_t m_applianceSourceToken{0};
   CEvent m_playerEvent;

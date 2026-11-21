@@ -12,6 +12,9 @@
 #include "filesystem/IFile.h"
 #include "utils/URIUtils.h"
 #include "utils/log.h"
+#include "video/AppliancePlayback.h"
+
+#include <cerrno>
 
 using namespace XFILE;
 
@@ -42,6 +45,8 @@ bool CDVDInputStreamFile::Open()
     return false;
 
   unsigned int flags = m_flags;
+  if (m_item.HasProperty(KODI::APPLIANCE::SOURCE_TOKEN))
+    flags |= READ_REPORT_FAILURE;
 
   // If this file is audio and/or video (= not a subtitle) flag to caller
   if (!m_item.IsSubtitle())
@@ -70,6 +75,7 @@ bool CDVDInputStreamFile::Open()
     m_content = m_pFile->GetImplementation()->GetProperty(XFILE::FILE_PROPERTY_CONTENT_TYPE);
 
   m_eof = false;
+  m_readError = false;
   return true;
 }
 
@@ -92,6 +98,10 @@ int CDVDInputStreamFile::Read(uint8_t* buf, int buf_size)
   if(!m_pFile) return -1;
 
   ssize_t ret = m_pFile->Read(buf, buf_size);
+  if (ret == -EAGAIN && m_item.HasProperty(KODI::APPLIANCE::SOURCE_TOKEN))
+    return -EAGAIN;
+  if (ret != 0)
+    m_readError = ret < 0;
 
   if (ret < 0)
     return -1; // player will retry read in case of error until playback is stopped

@@ -10,8 +10,10 @@
 
 #include "utils/Variant.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -106,6 +108,44 @@ struct ResolverRoute
   bool operator<(const ResolverRoute& other) const;
 };
 
+using PlaybackClock = std::chrono::steady_clock;
+
+// Provisional pilot limits. The time budget starts with failure or intentional recovery.
+inline constexpr auto QUICK_REPLAY_WINDOW = std::chrono::minutes{2};
+inline constexpr auto ROUTE_COOLDOWN = std::chrono::seconds{5};
+inline constexpr auto RETRY_TIME = std::chrono::seconds{30};
+inline constexpr unsigned int MAX_SOURCE_ATTEMPTS = 16;
+
+struct RetryBudget
+{
+  unsigned int attempts{0};
+  PlaybackClock::time_point deadline{PlaybackClock::time_point::max()};
+
+  void Start(PlaybackClock::time_point now);
+  bool CanTry(PlaybackClock::time_point now) const;
+};
+
+class PlaybackHistory
+{
+public:
+  struct Stop
+  {
+    PlaybackClock::time_point time;
+    FileIdentity file;
+    int64_t position;
+  };
+
+  void Stopped(int profile, const std::string& title, Stop stop);
+  void Started(int profile, const std::string& title);
+  const Stop* RecentStop(int profile, const std::string& title, PlaybackClock::time_point now);
+  void CoolRoute(int profile, const ResolverRoute& route, PlaybackClock::time_point now);
+  bool RouteCoolingDown(int profile, const ResolverRoute& route, PlaybackClock::time_point now);
+
+private:
+  std::map<std::pair<int, std::string>, Stop> m_stops;
+  std::map<std::pair<int, ResolverRoute>, PlaybackClock::time_point> m_cooldowns;
+};
+
 struct FileSize
 {
   SizeKind kind{SizeKind::Unknown};
@@ -196,6 +236,11 @@ struct RankedFile
   double sizeScore{0.0};
 };
 
+std::string StableFileKey(const FileIdentity& identity);
+std::string LastWorkingFile(const Title& title);
+void RememberWorkingFile(const Title& title, const std::string& key);
+void PreferWorkingFile(std::vector<RankedFile>& files, const std::string& key);
+
 std::vector<RankedFile> RankFiles(std::vector<FileCandidate> candidates,
                                   const TitleContext& title,
                                   const SelectionPreferences& preferences,
@@ -229,6 +274,9 @@ std::vector<FileCandidate> LocalFiles(const CVariant& entry, const Title& title)
 CVariant SelectFile(const CVariant& files, const CVariant& entry);
 std::vector<FileCandidate> Discover(const CVariant& entry,
                                     const CVariant& providers,
-                                    const std::string& titleKey);
-std::string Resolve(const CVariant& providers, const ResolverRoute& route);
+                                    const std::string& titleKey,
+                                    const std::atomic_bool& cancelled);
+std::string Resolve(const CVariant& providers,
+                    const ResolverRoute& route,
+                    const std::atomic_bool& cancelled);
 } // namespace KODI::APPLIANCE

@@ -23925,6 +23925,22 @@ msgctxt "#42019"
 msgid "No playable source supplied the requested tracks."
 msgstr ""
 
+msgctxt "#42020"
+msgid "Try another source"
+msgstr ""
+
+msgctxt "#42021"
+msgid "No playable source found"
+msgstr ""
+
+msgctxt "#42022"
+msgid "Playback retry limit reached"
+msgstr ""
+
+msgctxt "#42023"
+msgid "Retry"
+msgstr ""
+
 #. Generic video versions label (plural)
 #: xbmc/filesystem/VideoDatabaseDirectory.cpp
 #: xbmc/filesystem/VideoDatabaseDirectory/DirectoryNodeMoviesOverview.cpp

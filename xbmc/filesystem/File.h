@@ -189,6 +189,7 @@ public:
 
   void Attach(IFile *file);
   void Detach();
+  bool HasReadError() const { return m_readError; }
 
 private:
   int_type underflow() override;
@@ -200,6 +201,7 @@ private:
   char*  m_buffer;
   int    m_backsize;
   int    m_frontsize = 0;
+  bool m_readError{false};
 };
 
 // very basic file input stream

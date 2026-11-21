@@ -45,7 +45,8 @@
 					<onup>87</onup>
 					<ondown>noop</ondown>
 					<onleft>70048</onleft>
-					<onright>804</onright>
+					<onright condition="!String.IsEmpty(Window.Property(ApplianceSource))">70049</onright>
+					<onright condition="String.IsEmpty(Window.Property(ApplianceSource))">804</onright>
 					<control type="radiobutton" id="600">
 						<include content="OSDButton">
 							<param name="texture" value="osd/fullscreen/buttons/previous.png"/>
@@ -146,6 +147,13 @@
 					<ondown condition="Control.HasFocus(255)">13103</ondown>
 					<onleft>608</onleft>
 					<onright>600</onright>
+					<control type="button" id="70049">
+						<width>300</width>
+						<height>76</height>
+						<align>center</align>
+						<label>42020</label>
+						<visible>!String.IsEmpty(Window.Property(ApplianceSource))</visible>
+					</control>
 					<control type="radiobutton" id="804">
 						<include content="OSDButton">
 							<param name="texture" value="osd/fullscreen/buttons/home.png"/>
