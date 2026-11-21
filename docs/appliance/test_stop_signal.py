@@ -15,10 +15,13 @@ class KodiConnection:
         self.buffer = ""
         self.utf8_decoder = codecs.getincrementaldecoder("utf-8")()
         self.json_decoder = json.JSONDecoder()
+        self.request_id = 0
 
     def request(self, method, **params):
-        message = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        self.request_id += 1
+        message = {"jsonrpc": "2.0", "id": self.request_id, "method": method, "params": params}
         self.connection.sendall(json.dumps(message).encode())
+        return self.request_id
 
     def wait_for(self, method):
         deadline = monotonic() + 10

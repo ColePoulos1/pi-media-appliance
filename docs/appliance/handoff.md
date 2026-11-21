@@ -1,6 +1,6 @@
 # Engineering handoff
 
-**21 November 2026 · Milestone 3 points 1 through 4 are complete on desktop.** The desktop pilot passed the selector, language, and source replacement checks. Point 5 is next. The owner provisionally accepted Milestone 2 for development and deferred the live Pi run. The Pi 5 flash image passed file-level verification. Physical boot and live-provider playback still need confirmation.
+**21 November 2026 · Milestone 3 desktop acceptance passed.** The selector, language, recovery and scanned-library checks passed. The [point 5 evidence](#point-5-desktop-acceptance) records the desktop runs. The [M2 and M3 hardware records](#point-5-pi-5-records) track separate physical runs, including boot, provider playback, TV remote, iOS and Pi performance.
 
 ## Start Milestone 3
 
@@ -131,6 +131,100 @@ The language phases also verified that skipping the only dual-audio file removed
 2. Scan synthetic anchors with NFOs into the disposable library. Open the same movie and episode from TV detail Play/Resume, Favorites, Continue Watching and JSON-RPC `Player.Open` by library ID. Verify the same file choice, prompt behavior and title bookmark, including after switching sources and restarting Kodi. The existing fixture opens anchors by path. Record library-ID and GUI runs separately. Check ordinary file playback, Stop and EOF as controls. Verify physical TV input and the official iOS app when the Pi is available.
 3. Time only filtering, deduplication and ordering of 200 already-parsed candidates. Prepare deterministic inputs outside the timed region, warm up, then record at least 100 iterations and report the nearest-rank p95, count, build flags and fixture mix. In an isolated run measure peak resident memory above the same warmed process with inputs loaded, state the method/resolution, and report an unresolved delta if sampling cannot distinguish it. Record discovery, per-route resolution, silent-share fallback and Play-to-first-frame separately. The proposed Pi rank-only target is p95 below 50 ms. RAM has no approved threshold.
 4. Keep two hardware records. The saved [M2 image and checklist](#milestone-2-pi-5-test-image) cover deferred boot, SMB timing, live keyed Prowlarr/TorBox pack identity, exact member bytes and cross-source resume. Build an M3 image from the tested M3 revision for the new selection, language, recovery and performance runs. Record LibreELEC/Kodi revisions, build flags, Pi model/RAM, TV/audio chain, commands, results and next open question here. Keep secrets and personal evidence off Git. Desktop acceptance can be recorded while Pi measurements remain open.
+
+##### Point 5 desktop acceptance
+
+**21 November 2026.** Product revision `15bfac9b152c55d5e0ec5af431ded9a0737fc873` (tree `591144ef9946542b8629cea67427089414566ce5`). The point 5 changes add acceptance fixtures and measurements. The tests use Ubuntu 24.04.5 x86-64 on an Intel Core i7-8565U under Docker, the [M2 build flags](#milestone-2-desktop-evidence), software OpenGL under Xvfb and the point 3 ALSA null PCM. The reused desktop build still reports its original `3b695bf-m2-worktree` label. The production files changed since the Kodi base were compared against the pinned worktree after normalizing line endings. Use a fresh disposable profile for each first phase and the same profile after restart. The library fixture uses Kodi's local-information scraper and synthetic NFOs.
+
+```sh
+cmake --build /appliance-build --target kodi-test kodi-x11 -j 8
+cd /appliance-build
+./kodi-test --gtest_filter='TestAppliancePlayback.*:TestFile.Read'
+taskset -c 0 ./kodi-test --gtest_also_run_disabled_tests \
+  --gtest_filter=TestAppliancePlayback.DISABLED_MeasureRankOnly
+# Launch Kodi in the same Xvfb display as the fixture, at 1280x720x24.
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$baseline" --port 19107 --measure-frames
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$library" --port 19106 --library-phase first
+# Restart Kodi using the same library userdata.
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$library" --port 19106 --library-phase restart
+```
+
+The [point 3 language phases](#3-apply-the-viewers-language-choice-to-real-streams) and [point 4 recovery phases](#4-drive-replacement-and-resume-from-the-cause-of-the-event) also run with this product revision.
+
+After scanning the synthetic NFOs, changing files with the OSD and restarting Kodi, JSON-RPC `Player.Open` with `movieid` or `episodeid` and `resume: true` used the 320-pixel-wide alternate and the saved Sub choice. The movie resumed within two seconds of its 14.0-second saved position and the episode within two seconds of its 23.9-second saved position.
+
+In Estuary, detail Play for both titles prompted for Sub or Dub, Back canceled, and Sub played Japanese audio with full English subtitles when the preferred Spanish track was forced-only. OSD source changes preserved separate title bookmarks. After restarting, detail Resume, Favorites and the Home in-progress rows opened the same alternate and tracks for both titles. The TV in-progress row opened the show, then its episode. Each play matched its title bookmark within two seconds. These actions used JSON-RPC navigation keys against the desktop UI. Physical CEC and the official iOS app remain open.
+
+| Selection contract example | Check |
+| --- | --- |
+| Local beats a preferred HDR remote | `LocalTierWinsAgainstPreferredHdrRemote` and the baseline's playable local with zero provider requests |
+| Failed or missing local advances locally, then remotely | Baseline fifth-local, silent SMB, missing local and next eligible remote |
+| Credible WEB-DL beats the undersized Blu-ray | `PrefersCredibleMovieEncodeInBalancedAndHighQuality` |
+| Data Saver selects the smaller animation encode | `RanksAnimationByProfileWithBoundedBalancedSizeBenefit` |
+| Episode MB/min uses selected member bytes | `ScoresEpisodeMemberBytesAndAppliesRemoteCaps`, `AcceptsOnlyVerifiedEpisodeAndKeepsExactFileBytes` and the expired-link baseline |
+| Sub selects original audio and full subtitles across episodes and retries | Language first and restart phases, including the misleading filename and forced Spanish subtitle controls |
+| Skip excludes both routes to one file | `KeepsLocalOrderAndMergesOnlyTheSameTorrentMember` and recovery restart's remote-to-remote OSD change |
+| Stop, quick replay and later resume | `ScopesQuickReplayAndCooldown`, `PrefersLastWorkingFileOnlyAfterEligibility`, baseline Stop and recovery restart's Quick Play. The recovery restart also checks persisted last-working identity and clean EOF. |
+
+The loopback baseline checks that a duplicate Play starts one discovery, and that Stop during discovery or switching to ordinary playback suppresses stale results. `BoundsRecoveryByAttemptsAndMonotonicTime` checks that a second recovery signal leaves the existing deadline in place. The live player fixture covers token handling across playback notifications.
+
+All 14 appliance GTests and the ordinary `TestFile.Read` control passed. The loopback baseline resolved the exact 42,500-byte packed episode, recovered from an expired link and resumed across local and remote files in both directions. The language checks covered a second profile, change/clear and rejecting a misleading track label. The recovery checks covered clean EOF alongside the hard HTTP read failure, which resumed a distinct file at 19 seconds. OSD replacement, quick replay, manual selection and intentional Retry passed.
+
+| Desktop timing | Observation |
+| --- | --- |
+| Playable local to first visible frame | 0.570 s, with zero provider requests |
+| Remote-only Play to first visible frame | 0.597 s |
+| Silent SMB Play to first discovery request | 10.222 s with a 5 s Samba client timeout |
+| Silent SMB Play to first visible frame after a link refresh | 12.068 s |
+| Loopback discovery, search arrival through ready-list response | 2.32 ms for remote-only, 34.60 ms after silent SMB |
+| Loopback resolver, request handling through response write | 5.99 ms on the clean route. The fallback's initial link and refresh took 0.25 ms and 0.51 ms for the same route. |
+
+Each startup timing is one observation. The fixture polls the Xvfb center pixel every 5 ms for the synthetic frame color. Provider timings come from the loopback server and include scheduling on the desktop. HDMI presentation, live provider round trips and Pi latency remain unmeasured.
+
+Three fresh ranking processes pinned to logical CPU 0 ran 10 warmups and 120 measured iterations each. Each run uses 200 pre-parsed records for one 45-minute episode. There are 160 distinct remotes (20 excluded as 3D), 20 additional route reports for eligible remotes, and 20 locals. All iterations returned 160 eligible distinct files. Each timer starts after the mutable input copy and stops when `RankFiles` returns. Nearest-rank p95 (the 114th sample) was 6.94, 4.48 and 3.71 ms. The processes read Linux `VmRSS` after warming with the inputs loaded, reset the high-water mark using `clear_refs=5`, and read `VmHWM` after the ranking loop. The loop's resident high-water mark includes the mutable input copies. The host uses 4 KiB pages. Two runs reported a 128 KiB increase and the third could not resolve a rise. The RSS method gives no precise selector allocation figure.
+
+##### Point 5 Pi 5 records
+
+| Record | Target build | Physical evidence still needed |
+| --- | --- | --- |
+| M2 pilot | [Saved 12.2.1-m2.1 image and checklist](#milestone-2-pi-5-test-image) | Boot from the spare card, measure silent-share fallback, confirm the exact member and bytes through keyed Prowlarr/TorBox, then resume across sources. |
+| M3 acceptance | LibreELEC 12.2.1 at `6209f5a3b067c45fbf527286dd84ee483294b46a`, Kodi fork at `15bfac9b152c55d5e0ec5af431ded9a0737fc873`, Pi 5 AArch64 | Boot on the TV chain, repeat selection, language and recovery, measure performance, and verify inbound CEC and the Official Kodi Remote for iOS. |
+
+The M3 build uses an archive of the pinned Kodi tree with UTF-8 text normalized to LF for the LibreELEC patches and Kodi schema generator. The compressed archive has SHA-256 `8d74c3ab22f23108d529b50e56359fa48e7c98729f7e513e0fe8213130d1fb30`. On the Ubuntu 22.04 build host, apply the exported `libreelec-m3-source.patch` and serve `kodi-21.3-Omega-m3-15bfac9b.tar.gz` from the loopback directory named in the recipe. Use the unprivileged builder and the cached toolchain from M2.
+
+```sh
+# Start the loopback source server in a separate session.
+python3 -m http.server 19752 --bind 127.0.0.1 --directory /home/builder/kodi-source
+# In the LibreELEC checkout:
+export PROJECT=RPi DEVICE=RPi5 ARCH=aarch64
+export CUSTOM_VERSION=12.2.1-m3.1 BUILDER_NAME=pi-media-appliance CONCURRENCY_MAKE_LEVEL=7
+./scripts/unpack kodi
+make image
+```
+
+The cross-build uses GCC 13.2, `MinSizeRel`, Cortex-A76 tuning, effective C++ flags `-O3 -DNDEBUG`, and LTO. Test fixtures run separately from the flash image.
+
+The build completed in `pi-media-pi5-build` on 21 November 2026. The artifacts, source archive, recipe patch and acceptance logs are in `C:/Code/artifacts/pi-media-m3`. The compressed image is 43,450 bytes larger than the saved M2 image.
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `LibreELEC-RPi5.aarch64-12.2-12.2.1-m3.1.img.gz` | 164,479,093 | `d14ebd0e562b7433ad46b87b02a3d9eb6aefe7f9052980a8f7ddcbd4446aa75a` |
+| `LibreELEC-RPi5.aarch64-12.2-12.2.1-m3.1.tar` | 166,891,520 | `a2f2244131da5d29d4c12b16424fd3fd00d9494d11343a83289bcec0880ebc1a` |
+
+`sha256sum -c` passed for both files and `gzip -t` passed for the flash image. The two-partition flash image contains the Pi 5 device tree, an AArch64 Kodi binary and the Estuary source-change control. The update's `KERNEL` and `SYSTEM` matched the flash payload byte for byte. The exported files also passed Windows `Get-FileHash` checks. The physical boot and update runs remain open.
+
+The artifact directory also contains `kodi-appliance-rank-test`, SHA-256 `7bc9b2a8a7130a73d8392beca11074adb9a72ce0967022205c89adf28ab6b9d1`. It links the M3 Kodi libraries and the acceptance GTests using the image toolchain. All 14 tests and the benchmark completed under QEMU using libraries extracted from the M3 `SYSTEM`. Use the executable on the booted M3 spare card for native timing and RSS. With Kodi idle and the executable copied to `/storage`, run:
+
+```sh
+chmod +x /storage/kodi-appliance-rank-test
+/storage/kodi-appliance-rank-test --gtest_filter='TestAppliancePlayback.*'
+/storage/kodi-appliance-rank-test --gtest_also_run_disabled_tests \
+  --gtest_filter=TestAppliancePlayback.DISABLED_MeasureRankOnly
+```
+
+For each run record the Pi model and RAM, card, OS and Kodi versions, TV and audio chain, and whether HDMI-CEC input reaches navigation, playback OSD and Back. On the M3 card, scan one synthetic movie and episode, check the three quality profiles and a saved Sub choice, and use **Try another source** after seeking. Record the outgoing and incoming positions. Exercise explicit Stop and quick Play, then restart Kodi and check Resume from details, Favorites and the in-progress rows. Use the Official Kodi Remote for iOS to rediscover the Pi, open both library entries and control the running player.
+
+Time discovery and each route resolution separately from Play to the first visible frame. Keep the silent-share observation separate from a working local file and a remote-only start. Report the M3 rank-only p95 and incremental resident memory against the proposed below-50-ms p95 target for 200 parsed candidates. Record whether a silent real NAS connection reproduces the desktop's two Samba timeouts and whether the selected language and source remain stable across the actual TV and remote entry points.
 
 ## Reproducible starting point
 

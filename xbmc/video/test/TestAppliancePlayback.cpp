@@ -10,6 +10,9 @@
 #include "video/AppliancePlayback.h"
 
 #include <algorithm>
+#include <array>
+#include <fstream>
+#include <iostream>
 
 #include <gtest/gtest.h>
 
@@ -29,6 +32,73 @@ FileCandidate Remote(const TitleContext& title, char hashDigit, FileSize size)
   return {{Tier::Remote, std::string(40, hashDigit), "video.mkv"}, {}, {report}};
 }
 } // namespace
+
+TEST(TestAppliancePlayback, DISABLED_MeasureRankOnly)
+{
+  const TitleContext title{"episode:tmdb:900000002", 45min};
+  std::vector<FileCandidate> inputs;
+  for (unsigned int i = 0; i < 160; ++i)
+  {
+    auto file = Remote(title, 'a', {SizeKind::Exact, 600000000 + 10000000ULL * i});
+    file.identity.member = "synthetic/episode-" + std::to_string(i) + ".mkv";
+    file.routes.push_back({"fixture", "1", std::to_string(i)});
+    file.evidence.front().is3D = i >= 140;
+    inputs.push_back(std::move(file));
+  }
+  for (unsigned int i = 0; i < 20; ++i)
+  {
+    auto duplicate = inputs[i];
+    duplicate.routes.front().provider = "alternate";
+    inputs.push_back(std::move(duplicate));
+    auto local = inputs[i];
+    local.identity = {Tier::Local, {}, "/synthetic/local-" + std::to_string(i) + ".mkv"};
+    local.routes.clear();
+    inputs.push_back(std::move(local));
+  }
+  ASSERT_EQ(inputs.size(), 200u);
+  for (unsigned int i = 0; i < 10; ++i)
+    ASSERT_EQ(RankFiles(inputs, title, {}, {}).size(), 160u);
+
+#ifdef __linux__
+  const auto residentKiB = [](const std::string& field)
+  {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line))
+    {
+      if (line.compare(0, field.size(), field) == 0)
+        return std::stol(line.substr(field.size()));
+    }
+    return -1L;
+  };
+  const long baseline = residentKiB("VmRSS:");
+  std::ofstream reset("/proc/self/clear_refs");
+  const bool resetPeak = static_cast<bool>(reset << '5' << std::flush);
+#endif
+
+  std::array<double, 120> elapsed{};
+  for (auto& sample : elapsed)
+  {
+    // RankFiles takes ownership. Prepare its mutable input before starting the clock.
+    auto candidates = inputs;
+    const auto start = PlaybackClock::now();
+    const auto result = RankFiles(std::move(candidates), title, {}, {});
+    sample = std::chrono::duration<double, std::milli>(PlaybackClock::now() - start).count();
+    ASSERT_EQ(result.size(), 160u);
+  }
+
+#ifdef __linux__
+  const long peak = residentKiB("VmHWM:");
+  if (resetPeak && baseline >= 0 && peak > baseline)
+    std::cout << "Warmed RSS " << baseline << " KiB, peak " << peak << " KiB, delta "
+              << peak - baseline << " KiB\n";
+  else
+    std::cout << "Incremental RSS unresolved (baseline " << baseline << " KiB, peak " << peak
+              << " KiB, reset " << resetPeak << ")\n";
+#endif
+  std::sort(elapsed.begin(), elapsed.end());
+  std::cout << "Rank-only p95 " << elapsed[113] << " ms over " << elapsed.size() << " samples\n";
+}
 
 TEST(TestAppliancePlayback, BoundsRecoveryByAttemptsAndMonotonicTime)
 {
@@ -93,6 +163,22 @@ TEST(TestAppliancePlayback, PrefersLastWorkingFileOnlyAfterEligibility)
   PreferWorkingFile(remote, preferred);
   ASSERT_EQ(remote.size(), 1u);
   EXPECT_EQ(remote.front().file.identity.torrentHash, first.identity.torrentHash);
+}
+
+TEST(TestAppliancePlayback, LocalTierWinsAgainstPreferredHdrRemote)
+{
+  const TitleContext title{"movie:tmdb:900000001", 120min};
+  auto remote = Remote(title, 'a', {SizeKind::Exact, 7200000000});
+  remote.evidence.front().hdr = "hdr10";
+  remote.evidence.front().source = Source::BluRay;
+  auto local = Remote(title, 'b', {SizeKind::Unknown, 0});
+  local.identity = {Tier::Local, {}, "/synthetic/movie.mkv"};
+  local.evidence.front().resolution = 720;
+  const DeviceCapabilities device{1080, std::nullopt, std::set<std::string>{"hdr10"}};
+  const auto ranked = RankFiles({remote, local}, title, {}, device);
+  ASSERT_EQ(ranked.size(), 2u);
+  EXPECT_EQ(ranked.front().file.identity.tier, Tier::Local);
+  EXPECT_EQ(ranked.back().file.identity.tier, Tier::Remote);
 }
 
 TEST(TestAppliancePlayback, PrefersCredibleMovieEncodeInBalancedAndHighQuality)

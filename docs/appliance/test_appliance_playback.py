@@ -78,7 +78,9 @@ class Provider(BaseHTTPRequestHandler):
             ]
             self.reply(200, json.dumps({"success": True, "data": torrents}).encode(),
                        "application/json")
+            self.server.listed_at = monotonic()
         elif url.path == "/v1/api/torrents/requestdl":
+            started = monotonic()
             self.server.calls["resolve"] += 1
             assert "token" not in query
             route = (int(query["torrent_id"][0]), int(query["file_id"][0]))
@@ -96,6 +98,8 @@ class Provider(BaseHTTPRequestHandler):
                 reply = {"success": True,
                          "data": f"http://127.0.0.1:{self.server.server_port}/{source}"}
             self.reply(200, json.dumps(reply).encode(), "application/json")
+            if hasattr(self.server, "resolve_seconds"):
+                self.server.resolve_seconds.append((route, monotonic() - started))
         elif url.path == "/expired.mkv":
             self.server.calls["expired"] += 1
             self.reply(403, b"expired", "text/plain")
@@ -157,11 +161,11 @@ class Kodi(KodiConnection):
             yield message
 
     def call(self, method, **params):
-        self.request(method, **params)
+        request_id = self.request(method, **params)
         for message in self.messages(10):
-            if "id" in message:
-                if "error" in message:
-                    raise RuntimeError(f"{method}: {message['error']}")
+            if "error" in message:
+                raise RuntimeError(f"{method}: {message['error']}")
+            if message.get("id") == request_id:
                 return message["result"]
 
     def wait_for(self, method, timeout=10):
@@ -583,7 +587,224 @@ def recovery_check(userdata, port, phase):
             provider.shutdown()
 
 
-def run(userdata, port):
+def library_check(userdata, port, phase):
+    root = userdata / "appliance"
+    movies = root / "library" / "movies"
+    shows = root / "library" / "shows"
+    show = shows / "Pilot Show"
+    movie = movies / "movie-tmdb-900000001.mkv"
+    episode = show / "episode-tmdb-900000002.s01e02.mkv"
+    titles = (("movie", "Pilot Movie", movie, 15), ("episode", "Return", episode, 25))
+    media = root / "fixtures" / "dual.mkv"
+    alternate = media.with_name("alternate.mkv")
+    database, = (userdata / "Database").glob("MyVideos*.db")
+
+    if phase == "first":
+        root.mkdir()
+        movies.mkdir(parents=True)
+        show.mkdir(parents=True)
+        movie.touch()
+        episode.touch()
+        movie.with_suffix(".nfo").write_text(
+            '<movie><title>Pilot Movie</title><uniqueid type="tmdb" default="true">'
+            '900000001</uniqueid></movie>', encoding="utf-8")
+        (show / "tvshow.nfo").write_text(
+            '<tvshow><title>Pilot Show</title><uniqueid type="tmdb" default="true">'
+            '900000003</uniqueid></tvshow>', encoding="utf-8")
+        episode.with_suffix(".nfo").write_text(
+            '<episodedetails><title>Return</title><season>1</season><episode>2</episode>'
+            '<uniqueid type="tmdb" default="true">900000002</uniqueid></episodedetails>',
+            encoding="utf-8")
+        make_language_media(media.parent)
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(media),
+                        "-map", "0", "-c", "copy", "-vf", "scale=320:180", "-c:v", "mpeg4",
+                        "-g", "10", str(alternate)], check=True)
+        entry = {"local": [str(media), str(alternate)], "originalLanguage": "ja"}
+        write_json(root / "index.json", {"movie:tmdb:900000001": entry,
+                                        "episode:tmdb:900000002": dict(entry, episode="s01e02")})
+        # Configure only the source's scraper rows. Kodi scans and creates every title/file row.
+        with sqlite3.connect(database) as db:
+            db.executemany(
+                "INSERT INTO path (strPath, strContent, strScraper, scanRecursive, useFolderNames, "
+                "strSettings, noUpdate, exclude, allAudio) "
+                "VALUES (?, ?, 'metadata.local', 0, 0, '', 0, 0, 0)",
+                ((str(movies) + "/", "movies"), (str(shows) + "/", "tvshows")))
+
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+        kodi = Kodi(connection)
+        if phase == "first":
+            for folder in (movies, shows):
+                kodi.request("VideoLibrary.Scan", directory=str(folder) + "/", showdialogs=False)
+                kodi.wait_for("VideoLibrary.OnScanFinished", 20)
+            for setting, value in (("locale.audiolanguage", "English"),
+                                   ("locale.subtitlelanguage", "Spanish"),
+                                   ("myvideos.selectaction", 2), ("myvideos.playaction", 2),
+                                   ("myvideos.extractthumb", False), ("myvideos.extractflags", False)):
+                assert kodi.call("Settings.SetSettingValue", setting=setting, value=value)
+
+        def label():
+            return kodi.call("XBMC.GetInfoLabels", labels=["ListItem.Label"])["ListItem.Label"]
+
+        def video_title():
+            return kodi.call("XBMC.GetInfoLabels", labels=["ListItem.Title"])["ListItem.Title"]
+
+        def focus(condition, direction):
+            for _ in range(16):
+                if condition():
+                    return
+                kodi.call("Input." + direction)
+                sleep(0.1)
+            raise AssertionError(f"Could not focus the requested item, current label={label()!r}")
+
+        def open_videos(path):
+            kodi.call("GUI.ActivateWindow", window="videos", parameters=[path])
+            kodi.wait_until(lambda: kodi.window() == 10025)
+
+        def control_focused(control):
+            condition = f"Control.HasFocus({control})"
+            return kodi.call("XBMC.GetInfoBooleans", booleans=[condition])[condition]
+
+        def open_home_section(section):
+            kodi.call("Input.Home")
+            kodi.wait_until(lambda: kodi.window() == 10000)
+            focus(lambda: control_focused(9000), "Left")
+            field = "Container(9000).ListItem.Property(id)"
+            focus(lambda: kodi.call("XBMC.GetInfoLabels", labels=[field])[field] == section, "Down")
+
+        def bookmark(anchor):
+            with sqlite3.connect(database) as db:
+                row = db.execute(
+                    "SELECT timeInSeconds FROM bookmark JOIN files USING (idFile) "
+                    "WHERE strFilename = ? AND type = 1", (anchor.name,)
+                ).fetchone()
+            return row[0] if row else 0
+
+        def check_resume(anchor, expected, seek_to):
+            player = kodi.start()
+            kodi.tracks(player, "jpn", 320, "eng")
+
+            def at_bookmark():
+                time = kodi.call("Player.GetProperties", playerid=player, properties=["time"])["time"]
+                position = 60 * time["minutes"] + time["seconds"] + time["milliseconds"] / 1000
+                return abs(position - expected) <= 2
+
+            kodi.wait_until(at_bookmark, timeout=3)
+            kodi.seek(player, seek_to)
+            # A title switch saves progress without arming the quick replay window for this title.
+            kodi.stop(kodi.play(media))
+            kodi.wait_until(lambda: abs(bookmark(anchor) - seek_to) <= 2)
+
+        show_item, = kodi.call("VideoLibrary.GetTVShows")["tvshows"]
+        series = f"videodb://tvshows/titles/{show_item['tvshowid']}/"
+        for kind, title, anchor, seek_to in titles:
+            library_item, = kodi.call("VideoLibrary.GetMovies" if kind == "movie" else
+                                      "VideoLibrary.GetEpisodes", properties=["file", "uniqueid"])[kind + "s"]
+            assert library_item["file"] == str(anchor), library_item
+            assert library_item["uniqueid"]["tmdb"] == anchor.name.split("-")[2].split(".")[0]
+            library_id = library_item[kind + "id"]
+            browse = "videodb://movies/titles/" if kind == "movie" else series + "-1/"
+
+            def detail():
+                open_videos(browse)
+                focus(lambda: video_title() == title, "Down")
+                kodi.call("Input.ExecuteAction", action="info")
+                kodi.wait_until(lambda: kodi.window() == 12003)
+                kodi.request("Input.Select")
+
+            if phase == "first":
+                detail()
+                kodi.wait_until(lambda: kodi.window() == 12000)
+                kodi.call("Input.Back")
+                kodi.wait_until(lambda: kodi.window() != 12000)
+                assert kodi.call("Player.GetActivePlayers") == []
+                detail()
+                kodi.wait_until(lambda: kodi.window() == 12000)
+                kodi.request("Input.Select")
+                player = kodi.start()
+                kodi.tracks(player, "jpn", 240, "eng")
+                kodi.seek(player, seek_to)
+                player = kodi.try_another()
+                kodi.tracks(player, "jpn", 320, "eng")
+                assert abs(kodi.position(player) - seek_to) <= 2
+                kodi.stop(player)
+                kodi.wait_until(lambda: abs(bookmark(anchor) - seek_to) <= 2)
+                assert kodi.call("Favourites.AddFavourite", type="media", title=title,
+                                 path=str(anchor)) == "OK"
+                print(f"{kind}: scanned NFO, detail Play, Ask/Back, Sub, OSD switch and title bookmark")
+                continue
+
+            saved = bookmark(anchor)
+            assert abs(saved - seek_to) <= 2, (kind, saved)
+            kodi.request("Player.Open", item={kind + "id": library_id}, options={"resume": True})
+            check_resume(anchor, saved, seek_to)
+            print(f"{kind}: library ID resumed the saved source, tracks and {saved:.1f}s bookmark")
+            for route in ("detail", "favorite", "in-progress"):
+                saved = bookmark(anchor)
+                if route == "detail":
+                    detail()
+                elif route == "favorite":
+                    open_home_section("favorites")
+                    kodi.call("Input.Select")
+                    kodi.wait_until(lambda: kodi.window() == 10060)
+                    focus(lambda: label() == title, "Right")
+                    kodi.request("Input.Select")
+                else:
+                    open_home_section("movies" if kind == "movie" else "tvshows")
+                    kodi.call("Input.Right")
+                    focus(lambda: control_focused(5100 if kind == "movie" else 6100), "Down")
+                    if kind == "episode":
+                        kodi.call("Input.Select")
+                        kodi.wait_until(lambda: kodi.window() == 10025)
+                        focus(lambda: label() == "Season 1" or video_title() == title, "Down")
+                        if video_title() != title:
+                            kodi.call("Input.Select")
+                    focus(lambda: video_title() == title, "Down")
+                    kodi.request("Input.Select")
+                check_resume(anchor, saved, seek_to)
+                print(f"{kind}: Estuary {route} resumed the saved source, tracks and {saved:.1f}s bookmark")
+
+
+def play_to_frame(kodi, path, channel, resume=False):
+    # Sample the middle pixel of the Xvfb output, where the synthetic solid video appears.
+    from ctypes import CDLL, c_char_p, c_int, c_ulong, c_void_p
+
+    x11 = CDLL("libX11.so.6")
+    for name, result, args in (
+        ("XOpenDisplay", c_void_p, [c_char_p]),
+        ("XDefaultRootWindow", c_ulong, [c_void_p]),
+        ("XGetImage", c_void_p, [c_void_p, c_ulong, c_int, c_int, c_int, c_int, c_ulong, c_int]),
+        ("XGetPixel", c_ulong, [c_void_p, c_int, c_int]),
+        ("XDestroyImage", c_int, [c_void_p]), ("XCloseDisplay", c_int, [c_void_p]),
+    ):
+        function = getattr(x11, name)
+        function.restype, function.argtypes = result, args
+    display = x11.XOpenDisplay(None)
+    assert display, "Start Kodi and the frame check on the same 1280x720x24 Xvfb display"
+    try:
+        root = x11.XDefaultRootWindow(display)
+
+        def first_frame():
+            image = x11.XGetImage(display, root, 640, 360, 1, 1, ~0, 2)
+            assert image
+            pixel = x11.XGetPixel(image, 0, 0)
+            x11.XDestroyImage(image)
+            red, green, blue = ((pixel >> shift) & 255 for shift in (16, 8, 0))
+            colors = (red, blue) if channel == "red" else (blue, red)
+            return colors[0] > 180 and max(green, colors[1]) < 50
+
+        assert not first_frame(), "Synthetic frame was already visible before Play"
+        started = monotonic()
+        kodi.request("Player.Open", item={"file": str(path)}, options={"resume": resume})
+        while not first_frame():
+            assert monotonic() - started < 25, f"No {channel} video frame reached Xvfb"
+            sleep(0.005)
+        elapsed = monotonic() - started
+        return kodi.start(), elapsed
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def run(userdata, port, measure_frames=False):
     root = userdata / "appliance"
     root.mkdir()  # Fail before touching an existing appliance configuration.
     library = root / "library"
@@ -606,6 +827,7 @@ def run(userdata, port):
         with ThreadingHTTPServer(("127.0.0.1", 0), Provider) as provider:
             provider.calls = Counter()
             provider.resolved_routes = []
+            provider.resolve_seconds = []
             provider.mode = "refresh"
             provider.media = remote.read_bytes()
             provider.discovery_started = Event()
@@ -629,7 +851,11 @@ def run(userdata, port):
                     kodi = Kodi(connection)
                     kodi.stop(kodi.play(local))
                     kodi.stop(kodi.play(movie))
-                    player_id = kodi.play(episode)
+                    if measure_frames:
+                        player_id, frame_delay = play_to_frame(kodi, episode, "red")
+                        print(f"Local Play to first visible Xvfb frame: {frame_delay:.3f}s")
+                    else:
+                        player_id = kodi.play(episode)
                     assert not provider.calls, provider.calls
 
                     kodi.request("Player.Seek", playerid=player_id, value={"time": {"seconds": 15}})
@@ -656,7 +882,11 @@ def run(userdata, port):
                         ]
                         write_json(root / "index.json", index)
                         fallback_start = monotonic()
-                        player_id = kodi.play(episode, resume=True, timeout=25)
+                        if measure_frames:
+                            player_id, frame_delay = play_to_frame(kodi, episode, "blue", resume=True)
+                            print(f"Silent SMB and refreshed link to visible Xvfb frame: {frame_delay:.3f}s")
+                        else:
+                            player_id = kodi.play(episode, resume=True, timeout=25)
                     discovery_delay = provider.discovered_at - fallback_start
                     assert 4 <= discovery_delay < 20, discovery_delay
                     properties = kodi.call("Player.GetProperties", playerid=player_id,
@@ -671,6 +901,12 @@ def run(userdata, port):
                     kodi.wait_until(lambda: kodi.position(player_id) >= 14)
                     kodi.stop(player_id)
                     print(f"Silent SMB connection to discovery in {discovery_delay:.3f}s", flush=True)
+                    if measure_frames:
+                        print(f"Fallback discovery from search through list response: "
+                              f"{1000 * (provider.listed_at - provider.discovered_at):.2f}ms")
+                        for route, elapsed in provider.resolve_seconds:
+                            print(f"Fallback resolver request {route} through response: "
+                                  f"{1000 * elapsed:.2f}ms")
 
                     index["episode:tmdb:900000002"]["local"] = [str(local)]
                     write_json(root / "index.json", index)
@@ -730,6 +966,20 @@ def run(userdata, port):
                         else:
                             assert kodi.call("Player.GetActivePlayers") == []
                     print("Duplicate Play, Stop during discovery and switch to ordinary playback passed")
+                    if measure_frames:
+                        clean = library / "episode-tmdb-900000003.s01e02.mkv"
+                        clean.touch()
+                        index["episode:tmdb:900000003"] = index["episode:tmdb:900000002"]
+                        write_json(root / "index.json", index)
+                        provider.mode = "clean"
+                        provider.resolve_seconds.clear()
+                        player_id, frame_delay = play_to_frame(kodi, clean, "blue")
+                        kodi.stop(player_id)
+                        print(f"Remote-only Play to first visible Xvfb frame: {frame_delay:.3f}s")
+                        print(f"Discovery from search request through list response: "
+                              f"{1000 * (provider.listed_at - provider.discovered_at):.2f}ms")
+                        for route, elapsed in provider.resolve_seconds:
+                            print(f"Resolver request {route} through response: {1000 * elapsed:.2f}ms")
             finally:
                 provider.shutdown()
 
@@ -740,11 +990,16 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=19090)
     parser.add_argument("--language-phase", choices=["first", "restart", "second-profile"])
     parser.add_argument("--recovery-phase", choices=["first", "restart"])
+    parser.add_argument("--library-phase", choices=["first", "restart"])
+    parser.add_argument("--measure-frames", action="store_true",
+                        help="sample first visible frames on a 1280x720x24 Linux Xvfb display")
     args = parser.parse_args()
     userdata = args.userdata.resolve(strict=True)
     if args.language_phase:
         language_check(userdata, args.port, args.language_phase)
     elif args.recovery_phase:
         recovery_check(userdata, args.port, args.recovery_phase)
+    elif args.library_phase:
+        library_check(userdata, args.port, args.library_phase)
     else:
-        run(userdata, args.port)
+        run(userdata, args.port, args.measure_frames)
