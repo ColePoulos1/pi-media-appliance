@@ -23843,6 +23843,88 @@ msgstr ""
 
 # 40000 to 40800 are reserved for Video Versions feature
 
+# 42000 and above are used by the Pi media appliance fork.
+
+msgctxt "#42000"
+msgid "Appliance playback"
+msgstr ""
+
+msgctxt "#42001"
+msgid "Source quality"
+msgstr ""
+
+msgctxt "#42002"
+msgid "Balanced"
+msgstr ""
+
+msgctxt "#42003"
+msgid "High Quality"
+msgstr ""
+
+msgctxt "#42004"
+msgid "Data Saver"
+msgstr ""
+
+msgctxt "#42005"
+msgid "Movie language"
+msgstr ""
+
+msgctxt "#42006"
+msgid "TV language"
+msgstr ""
+
+msgctxt "#42007"
+msgid "Ask on first play"
+msgstr ""
+
+msgctxt "#42008"
+msgid "Prefer Sub"
+msgstr ""
+
+msgctxt "#42009"
+msgid "Prefer Dub"
+msgstr ""
+
+msgctxt "#42010"
+msgid "Choose a playback language"
+msgstr ""
+
+msgctxt "#42011"
+msgid "Sub · {0} audio, {1} subtitles"
+msgstr ""
+
+msgctxt "#42012"
+msgid "Dub · {0} audio"
+msgstr ""
+
+msgctxt "#42013"
+msgid "Clear saved choice"
+msgstr ""
+
+msgctxt "#42014"
+msgid "Playback language"
+msgstr ""
+
+msgctxt "#42015"
+msgid "Requested tracks unavailable. Try another language?"
+msgstr ""
+
+msgctxt "#42016"
+msgid "Anime language"
+msgstr ""
+
+msgctxt "#42017"
+msgid "Choose how the appliance prioritizes eligible sources."
+msgstr ""
+
+msgctxt "#42018"
+msgid "Choose how to handle titles whose original language differs from your audio language."
+msgstr ""
+
+msgctxt "#42019"
+msgid "No playable source supplied the requested tracks."
+msgstr ""
+
 #. Generic video versions label (plural)
 #: xbmc/filesystem/VideoDatabaseDirectory.cpp
 #: xbmc/filesystem/VideoDatabaseDirectory/DirectoryNodeMoviesOverview.cpp

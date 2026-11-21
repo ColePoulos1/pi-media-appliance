@@ -9,27 +9,158 @@
 #include "AppliancePlayback.h"
 
 #include "FileItem.h"
+#include "LangInfo.h"
+#include "ServiceBroker.h"
 #include "URL.h"
+#include "application/ApplicationPlayer.h"
+#include "cores/IPlayer.h"
+#include "cores/VideoPlayer/Interface/StreamInfo.h"
+#include "dialogs/GUIDialogSelect.h"
+#include "filesystem/Directory.h"
 #include "filesystem/DllLibCurl.h"
 #include "filesystem/File.h"
 #include "filesystem/SpecialProtocol.h"
+#include "guilib/GUIComponent.h"
+#include "guilib/GUIWindowManager.h"
+#include "guilib/LocalizeStrings.h"
+#include "profiles/ProfileManager.h"
+#include "settings/Settings.h"
+#include "settings/SettingsComponent.h"
 #include "utils/JSONVariantParser.h"
+#include "utils/LangCodeExpander.h"
 #include "utils/StringUtils.h"
 #include "utils/URIUtils.h"
+#include "utils/log.h"
+#include "video/VideoDatabase.h"
 #include "video/VideoInfoTag.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <filesystem>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <regex>
 #include <set>
+#include <tuple>
+#include <utility>
 
 namespace KODI::APPLIANCE
 {
 namespace
 {
 constexpr char ROOT[] = "special://profile/appliance/";
-constexpr char TORBOX[] = "https://api.torbox.app/v1/api/torrents/";
+constexpr char TORBOX[] = "https://api.torbox.app";
+constexpr char TORBOX_TORRENTS[] = "/v1/api/torrents/";
+constexpr char TORBOX_PROVIDER[] = "torbox";
+constexpr char VIDEO_EXTENSIONS[] = ".mkv|.mp4|.m4v|.avi|.webm|.mov|.ts|.m2ts";
 constexpr size_t MAX_RESPONSE = 2 * 1024 * 1024;
+constexpr unsigned int RELEASE_LIMIT = 50;
+constexpr unsigned int TORRENT_LIMIT = 200;
+
+std::string NormalizeLanguage(const std::string& value)
+{
+  if (value.empty() || StringUtils::EqualsNoCase(value, "und") ||
+      StringUtils::EqualsNoCase(value, "zxx") || StringUtils::EqualsNoCase(value, "mul"))
+    return {};
+  const auto primary = value.substr(0, value.find_first_of("-_"));
+  std::string code;
+  if (g_LangCodeExpander.ConvertToISO6392B(primary, code))
+    return code;
+  std::string name;
+  if (g_LangCodeExpander.Lookup(primary, name))
+  {
+    code = g_LangCodeExpander.ConvertToISO6392B(name);
+    return code.size() == 3 ? code : primary;
+  }
+  return {};
+}
+
+bool FullSubtitle(const SubtitleStreamInfo& info)
+{
+  return info.valid && !(info.flags & (FLAG_FORCED | FLAG_COMMENT | FLAG_LYRICS | FLAG_KARAOKE));
+}
+
+std::string ChoicePath(const PlaybackLanguage& language)
+{
+  std::string filename = language.key;
+  StringUtils::Replace(filename, ':', '-');
+  return std::string(ROOT) + "language/" + filename;
+}
+
+LanguageChoice ReadChoice(const PlaybackLanguage& language)
+{
+  XFILE::CFile file;
+  char value = 0;
+  if (file.Open(ChoicePath(language)) && file.GetLength() == 1 && file.Read(&value, 1) == 1)
+  {
+    if (value == 's')
+      return LanguageChoice::Sub;
+    if (value == 'd')
+      return LanguageChoice::Dub;
+  }
+  return LanguageChoice::Ordinary;
+}
+
+bool SaveChoice(const PlaybackLanguage& language, LanguageChoice choice)
+{
+  const std::string path = ChoicePath(language);
+  if (choice == LanguageChoice::Ordinary)
+    return !XFILE::CFile::Exists(path) || XFILE::CFile::Delete(path);
+
+  XFILE::CDirectory::Create(std::string(ROOT) + "language");
+  const auto target = std::filesystem::u8path(CSpecialProtocol::TranslatePath(path));
+  const std::string pending = path + ".tmp";
+  XFILE::CFile file;
+  const char value = choice == LanguageChoice::Sub ? 's' : 'd';
+  if (!file.OpenForWrite(pending, true))
+    return false;
+  const bool written = file.Write(&value, 1) == 1;
+  file.Flush();
+  file.Close();
+  std::error_code error;
+  if (written)
+    std::filesystem::rename(std::filesystem::u8path(CSpecialProtocol::TranslatePath(pending)),
+                            target, error);
+  if (!written || error)
+  {
+    XFILE::CFile::Delete(pending);
+    return false;
+  }
+  return true;
+}
+
+std::string LanguageName(const std::string& code)
+{
+  std::string name;
+  return g_LangCodeExpander.Lookup(code, name) ? name : code;
+}
+
+std::string ChoiceLabel(const PlaybackLanguage& language, LanguageChoice choice)
+{
+  if (choice == LanguageChoice::Dub)
+    return StringUtils::Format(g_localizeStrings.Get(42012), LanguageName(language.audio));
+  return StringUtils::Format(g_localizeStrings.Get(42011), LanguageName(language.original),
+                             LanguageName(language.subtitles));
+}
+
+TrackEvidence VerifiedLanguages(const CVariant& values)
+{
+  TrackEvidence tracks;
+  if (!values.isArray())
+    return tracks;
+
+  for (auto it = values.begin_array(); it != values.end_array(); ++it)
+  {
+    std::string code = NormalizeLanguage(it->asString());
+    if (code.empty())
+      return {};
+    tracks.languages.insert(std::move(code));
+  }
+  tracks.verified = true;
+  return tracks;
+}
 
 CVariant ReadJson(const std::string& path)
 {
@@ -110,6 +241,14 @@ std::string Words(std::string value)
   return value;
 }
 
+std::string NormalizeInfoHash(std::string hash)
+{
+  if (hash.size() != 40 || hash.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+    return {};
+  StringUtils::ToLower(hash);
+  return hash;
+}
+
 std::string InfoHash(const CVariant& release)
 {
   std::string hash = release["infoHash"].asString();
@@ -123,17 +262,21 @@ std::string InfoHash(const CVariant& release)
       hash = match[1].str();
   }
 
-  if (hash.size() != 40 || hash.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
-    return {};
-  StringUtils::ToLower(hash);
-  return hash;
+  return NormalizeInfoHash(std::move(hash));
+}
+
+size_t ReleaseSuffix(const std::string& stem)
+{
+  static const std::regex suffix(
+      R"( (?:2160p|1080p|720p|480p|web dl|webrip|bluray|hdtv|remux|x264|x265|hevc)(?: |$))");
+  std::smatch match;
+  return std::regex_search(stem, match, suffix) ? match.position() : std::string::npos;
 }
 
 bool MatchesFile(const CVariant& file, const CVariant& entry)
 {
   const std::string name = URIUtils::GetFileName(file["name"].asString());
-  if (name.size() > 255 ||
-      !URIUtils::HasExtension(name, ".mkv|.mp4|.m4v|.avi|.webm|.mov|.ts|.m2ts"))
+  if (name.size() > 255 || !URIUtils::HasExtension(name, VIDEO_EXTENSIONS))
     return false;
 
   std::string stem = Words(name.substr(0, name.rfind('.')));
@@ -142,11 +285,9 @@ bool MatchesFile(const CVariant& file, const CVariant& entry)
   if (title.empty())
     return false;
 
-  static const std::regex releaseSuffix(
-      R"( (?:2160p|1080p|720p|480p|web dl|webrip|bluray|hdtv|remux|x264|x265|hevc)(?: |$))");
-  std::smatch suffix;
-  if (std::regex_search(stem, suffix, releaseSuffix))
-    stem.resize(suffix.position());
+  const size_t suffix = ReleaseSuffix(stem);
+  if (suffix != std::string::npos)
+    stem.resize(suffix);
 
   if (episode.empty())
     return stem == title;
@@ -162,7 +303,361 @@ bool MatchesFile(const CVariant& file, const CVariant& entry)
          stem.substr(1, mark - 1) == Words(entry["query"].asString()) &&
          stem.substr(mark + episode.size() + 2) == title;
 }
+
+int64_t ReadId(const CVariant& value)
+{
+  return value.isInteger() || value.isUnsignedInteger() ? value.asInteger(-1) : -1;
+}
+
+FileEvidence NameEvidence(const std::string& name, bool containsTitle)
+{
+  FileEvidence evidence;
+  if (name.size() > 512)
+    return evidence;
+
+  const std::string normalized = Words(name);
+  const size_t suffix = containsTitle ? ReleaseSuffix(normalized) : 0;
+  if (suffix == std::string::npos)
+    return evidence;
+
+  const std::string words = " " + normalized.substr(suffix) + " ";
+  const auto has = [&](const char* word) { return words.find(word) != std::string::npos; };
+  if (has(" 2160p "))
+    evidence.resolution = 2160;
+  else if (has(" 1080p "))
+    evidence.resolution = 1080;
+  else if (has(" 720p "))
+    evidence.resolution = 720;
+  else if (has(" 480p "))
+    evidence.resolution = 480;
+
+  if (has(" hevc ") || has(" x265 ") || has(" h265 ") || has(" h 265 "))
+    evidence.codec = "hevc";
+  else if (has(" av1 "))
+    evidence.codec = "av1";
+  else if (has(" vp9 "))
+    evidence.codec = "vp9";
+  else if (has(" x264 ") || has(" h264 ") || has(" h 264 "))
+    evidence.codec = "h264";
+
+  if (has(" remux "))
+    evidence.source = Source::Remux;
+  else if (has(" bluray ") || has(" blu ray "))
+    evidence.source = Source::BluRay;
+  else if (has(" web dl ") || has(" webdl "))
+    evidence.source = Source::WebDl;
+
+  if (has(" dolby vision ") || has(" dovi "))
+    evidence.hdr = "dolbyvision";
+  else if (has(" hdr10+ ") || has(" hdr10plus "))
+    evidence.hdr = "hdr10plus";
+  else if (has(" hdr10 "))
+    evidence.hdr = "hdr10";
+  else if (has(" hlg "))
+    evidence.hdr = "hlg";
+  else if (has(" sdr "))
+    evidence.hdr = "sdr";
+
+  if (has(" 3d ") || has(" hsbs ") || has(" hou "))
+    evidence.is3D = true;
+  return evidence;
+}
+
+bool IsLocalVideo(const std::string& path, const CURL& url)
+{
+  return !path.empty() && path.find('\0') == std::string::npos &&
+         (url.IsProtocol("smb") || (url.GetProtocol().empty() && CURL::IsFullPath(path))) &&
+         URIUtils::HasExtension(path, VIDEO_EXTENSIONS);
+}
+
+bool NormalizeIdentity(FileIdentity& identity)
+{
+  if (identity.member.empty())
+    return false;
+  if (identity.tier == Tier::Local)
+    return identity.torrentHash.empty();
+  identity.torrentHash = NormalizeInfoHash(std::move(identity.torrentHash));
+  return !identity.torrentHash.empty();
+}
+
+bool IsExcluded(const std::string& value, const std::optional<std::set<std::string>>& supported)
+{
+  return !value.empty() && supported && !supported->count(value);
+}
+
+bool TrackMismatch(const TrackEvidence& tracks,
+                   const std::string& required,
+                   const std::string& fallback = {})
+{
+  return tracks.verified && !required.empty() && !tracks.languages.count(required) &&
+         (fallback.empty() || !tracks.languages.count(fallback));
+}
+
+int TrackScore(const TrackEvidence& tracks, const std::string& required)
+{
+  if (required.empty() || !tracks.languages.count(required))
+    return 0;
+  return tracks.verified ? 3 : 1;
+}
+
+template<typename T>
+size_t SortPreference(const std::vector<T>& order, const T& value)
+{
+  return static_cast<size_t>(order.end() - std::find(order.begin(), order.end(), value));
+}
+
+bool IsHdr(const std::string& hdr)
+{
+  return !hdr.empty() && hdr != "sdr";
+}
+
+double CodecFactor(const std::string& codec)
+{
+  return codec == "hevc" || codec == "av1" || codec == "vp9" ? 0.75 : 1.0;
+}
+
+double SizeScore(double mbPerMinute,
+                 Profile profile,
+                 const TitleContext& title,
+                 unsigned int resolution,
+                 double codecFactor,
+                 Source source)
+{
+  // Provisional decimal MB/min bands for 1080p H.264 WEB-DL. Calibrate with playback evidence.
+  constexpr double CREDIBLE_FLOOR = 26.0;
+  constexpr double BALANCED_PLATEAU = 55.0;
+  constexpr double HIGH_QUALITY_PLATEAU = 95.0;
+  const double resolutionFactor = resolution >= 2160                    ? 1.9
+                                  : resolution > 0 && resolution <= 720 ? 0.65
+                                                                        : 1.0;
+  const double sourceFactor = source == Source::Remux ? 1.6 : source == Source::BluRay ? 1.05 : 1.0;
+  const double contentFactor =
+      (title.lowMotionAnimation ? 0.45 : 1.0) * (title.grainOrRestoration ? 1.3 : 1.0);
+  const double rate = mbPerMinute / (resolutionFactor * codecFactor * sourceFactor * contentFactor);
+  const double undersize = std::max(0.0, 1.0 - rate / CREDIBLE_FLOOR);
+
+  switch (profile)
+  {
+    case Profile::Balanced:
+      return std::min(1.0, rate / BALANCED_PLATEAU) - undersize;
+    case Profile::HighQuality:
+      return std::min(1.0, rate / HIGH_QUALITY_PLATEAU) - 2.0 * undersize;
+    case Profile::DataSaver:
+      if (undersize > 0.0)
+        return -1.0 - 2.0 * undersize;
+      return 1.0 - std::clamp((rate - CREDIBLE_FLOOR) / (HIGH_QUALITY_PLATEAU - CREDIBLE_FLOOR),
+                              0.0, 2.0);
+  }
+  return 0.0;
+}
+
+struct OrderedFile
+{
+  RankedFile ranked;
+  int tracks{0};
+  double quality{0.0};
+  std::array<size_t, 5> sort{};
+};
+
+std::optional<OrderedFile> Evaluate(FileCandidate file,
+                                    const TitleContext& title,
+                                    const SelectionPreferences& preferences,
+                                    const DeviceCapabilities& device)
+{
+  const auto& overrides = preferences.capabilityOverrides;
+  const auto& codecs = overrides.codecs ? overrides.codecs : device.codecs;
+  const auto& hdrFormats = overrides.hdrFormats ? overrides.hdrFormats : device.hdrFormats;
+  const auto& supports3D = overrides.supports3D ? overrides.supports3D : device.supports3D;
+  const unsigned int deviceMax =
+      overrides.maxResolution ? overrides.maxResolution : device.maxResolution;
+  bool matched = false;
+  bool available = false;
+  unsigned int resolution = 0;
+  double codecFactor = 0.0;
+  Source source = Source::Unknown;
+  bool supportedHdr = false;
+  FileSize size;
+  int audio = 0;
+  int subtitles = 0;
+  OrderedFile result;
+
+  for (const auto& report : file.evidence)
+  {
+    if ((!report.titleKey.empty() && report.titleKey != title.key) ||
+        (report.is3D.value_or(false) && (!preferences.allow3D || !supports3D.value_or(true))) ||
+        (deviceMax && report.resolution > deviceMax) ||
+        (preferences.maxResolution && report.resolution > preferences.maxResolution) ||
+        (report.resolution && preferences.excludedResolutions.count(report.resolution)) ||
+        (!report.codec.empty() && preferences.excludedCodecs.count(report.codec)) ||
+        IsExcluded(report.codec, codecs) ||
+        (IsHdr(report.hdr) && IsExcluded(report.hdr, hdrFormats)) ||
+        TrackMismatch(report.audio, preferences.requiredAudio) ||
+        TrackMismatch(report.subtitles, preferences.requiredSubtitles,
+                      preferences.fallbackSubtitles))
+      return std::nullopt;
+
+    matched |= !report.titleKey.empty();
+    available |= report.availability != Availability::Unavailable;
+    if (report.size.kind >= SizeKind::Estimate && report.size.bytes &&
+        std::tie(report.size.kind, report.size.bytes) > std::tie(size.kind, size.bytes))
+      size = report.size;
+
+    audio = std::max(audio, TrackScore(report.audio, preferences.requiredAudio));
+    const int preferred = TrackScore(report.subtitles, preferences.requiredSubtitles);
+    const int fallback = TrackScore(report.subtitles, preferences.fallbackSubtitles);
+    subtitles = std::max(subtitles, preferred ? preferred + 1 : fallback);
+    resolution = std::max(resolution, report.resolution);
+    if (!report.codec.empty())
+      codecFactor = std::max(codecFactor, CodecFactor(report.codec));
+    source = std::max(source, report.source);
+    supportedHdr |= IsHdr(report.hdr) && hdrFormats && hdrFormats->count(report.hdr);
+    result.sort[0] =
+        std::max(result.sort[0], SortPreference(preferences.resolutionOrder, report.resolution));
+    result.sort[1] = std::max(result.sort[1], SortPreference(preferences.codecOrder, report.codec));
+    result.sort[2] =
+        std::max(result.sort[2], SortPreference(preferences.sourceOrder, report.source));
+    result.sort[3] = std::max(result.sort[3], SortPreference(preferences.hdrOrder, report.hdr));
+  }
+  if (!matched || !available)
+    return std::nullopt;
+
+  if (file.identity.tier == Tier::Remote)
+  {
+    if ((!size.bytes && !preferences.allowUnknownSize) ||
+        (preferences.maxStreamBytes && size.bytes > preferences.maxStreamBytes))
+      return std::nullopt;
+
+    const double minutes = title.runtime.count();
+    if (size.bytes && std::isfinite(minutes) && minutes > 0.0)
+    {
+      constexpr double BYTES_PER_MB = 1000000.0;
+      const double bytesPerMinute = static_cast<double>(size.bytes) / minutes;
+      if (preferences.maxStreamBitsPerSecond &&
+          bytesPerMinute * 8.0 / 60.0 > static_cast<double>(preferences.maxStreamBitsPerSecond))
+        return std::nullopt;
+
+      result.ranked.mbPerMinute = bytesPerMinute / BYTES_PER_MB;
+      result.ranked.sizeScore = SizeScore(*result.ranked.mbPerMinute, preferences.profile, title,
+                                          resolution, codecFactor ? codecFactor : 1.0, source);
+      if (size.kind == SizeKind::Estimate)
+        result.ranked.sizeScore *= 0.5;
+    }
+  }
+
+  const std::set<ResolverRoute> routes(file.routes.begin(), file.routes.end());
+  file.routes.assign(routes.begin(), routes.end());
+  for (const auto& route : file.routes)
+    result.sort[4] =
+        std::max(result.sort[4], SortPreference(preferences.providerOrder, route.provider));
+
+  result.tracks = audio + subtitles;
+  result.quality = result.ranked.sizeScore + (source >= Source::BluRay ? 0.15 : 0.0) +
+                   (supportedHdr ? 0.1 : 0.0);
+  result.ranked.file = std::move(file);
+  return result;
+}
 } // namespace
+
+bool FileIdentity::operator<(const FileIdentity& other) const
+{
+  return std::tie(tier, torrentHash, member) <
+         std::tie(other.tier, other.torrentHash, other.member);
+}
+
+bool ResolverRoute::operator<(const ResolverRoute& other) const
+{
+  return std::tie(provider, torrentId, fileId) <
+         std::tie(other.provider, other.torrentId, other.fileId);
+}
+
+FileSize FileSize::FromMemberBytes(const CVariant& value)
+{
+  const uint64_t bytes = value.isUnsignedInteger() || (value.isInteger() && value.asInteger() > 0)
+                             ? value.asUnsignedInteger()
+                             : 0;
+  return bytes ? FileSize{SizeKind::Exact, bytes} : FileSize{};
+}
+
+std::vector<RankedFile> RankFiles(std::vector<FileCandidate> candidates,
+                                  const TitleContext& title,
+                                  const SelectionPreferences& preferences,
+                                  const DeviceCapabilities& device)
+{
+  std::set<FileIdentity> skipped;
+  for (auto identity : preferences.skipped)
+  {
+    if (NormalizeIdentity(identity))
+      skipped.insert(std::move(identity));
+  }
+
+  std::map<FileIdentity, size_t> positions;
+  std::vector<FileCandidate> merged;
+  for (auto& candidate : candidates)
+  {
+    if (!NormalizeIdentity(candidate.identity) || skipped.count(candidate.identity))
+      continue;
+    const auto [position, inserted] = positions.try_emplace(candidate.identity, merged.size());
+    if (inserted)
+    {
+      merged.push_back(std::move(candidate));
+      continue;
+    }
+    auto& file = merged[position->second];
+    file.routes.insert(file.routes.end(), std::make_move_iterator(candidate.routes.begin()),
+                       std::make_move_iterator(candidate.routes.end()));
+    file.evidence.insert(file.evidence.end(), std::make_move_iterator(candidate.evidence.begin()),
+                         std::make_move_iterator(candidate.evidence.end()));
+  }
+
+  std::vector<OrderedFile> ordered;
+  for (auto& file : merged)
+  {
+    if (auto eligible = Evaluate(std::move(file), title, preferences, device))
+      ordered.push_back(std::move(*eligible));
+  }
+  std::stable_sort(ordered.begin(), ordered.end(),
+                   [](const auto& left, const auto& right)
+                   {
+                     const auto& a = left.ranked.file.identity;
+                     const auto& b = right.ranked.file.identity;
+                     if (a.tier != b.tier)
+                       return a.tier < b.tier;
+                     if (left.tracks != right.tracks)
+                       return left.tracks > right.tracks;
+                     if (a.tier == Tier::Local && left.sort != right.sort)
+                       return left.sort > right.sort;
+                     if (left.quality != right.quality)
+                       return left.quality > right.quality;
+                     if (left.sort != right.sort)
+                       return left.sort > right.sort;
+                     return a.tier == Tier::Remote && a < b;
+                   });
+
+  std::vector<RankedFile> result;
+  result.reserve(ordered.size());
+  for (auto& file : ordered)
+    result.push_back(std::move(file.ranked));
+  return result;
+}
+
+bool HasKnownLanguage(const std::vector<RankedFile>& files, const SelectionPreferences& preferences)
+{
+  for (const auto& candidate : files)
+  {
+    bool audio = false;
+    bool subtitles = preferences.requiredSubtitles.empty();
+    for (const auto& evidence : candidate.file.evidence)
+    {
+      audio |= evidence.audio.verified && evidence.audio.languages.count(preferences.requiredAudio);
+      subtitles |= evidence.subtitles.verified &&
+                   (evidence.subtitles.languages.count(preferences.requiredSubtitles) ||
+                    evidence.subtitles.languages.count(preferences.fallbackSubtitles));
+    }
+    if (audio && subtitles)
+      return true;
+  }
+  return false;
+}
 
 Title GetTitle(const CFileItem& item)
 {
@@ -204,142 +699,387 @@ CVariant LoadIndexEntry(const Title& title)
   return entry;
 }
 
+Profile GetQualityProfile()
+{
+  const auto value =
+      CServiceBroker::GetSettingsComponent()->GetSettings()->GetString("appliance.quality");
+  if (value == "high")
+    return Profile::HighQuality;
+  if (value == "data")
+    return Profile::DataSaver;
+  return Profile::Balanced;
+}
+
+PlaybackLanguage GetPlaybackLanguage(const Title& title,
+                                     const CFileItem& item,
+                                     const CVariant& entry)
+{
+  const bool episode = !title.episode.empty();
+  const char* setting = entry["anime"].asBoolean() ? "appliance.animelanguage"
+                        : episode                  ? "appliance.tvlanguage"
+                                                   : "appliance.movielanguage";
+  PlaybackLanguage language{title.key, NormalizeLanguage(entry["originalLanguage"].asString()),
+                            NormalizeLanguage(g_langInfo.GetAudioLanguage()),
+                            NormalizeLanguage(g_langInfo.GetSubtitleLanguage()), setting};
+  if (language.subtitles.empty())
+    language.subtitles = language.audio;
+  if (!episode || language.original.empty() || language.original == language.audio)
+    return language;
+
+  static const std::regex seriesId(R"([a-z][a-z0-9_-]{0,31}:[a-zA-Z0-9_]{1,64})");
+  std::string series = entry["seriesId"].asString();
+  if (!std::regex_match(series, seriesId) && item.HasVideoInfoTag() &&
+      item.GetVideoInfoTag()->m_iIdShow > 0)
+  {
+    CVideoDatabase database;
+    CVideoInfoTag show;
+    if (database.Open() && database.GetTvShowInfo("", show, item.GetVideoInfoTag()->m_iIdShow))
+      series = "tmdb:" + show.GetUniqueID("tmdb");
+  }
+  if (std::regex_match(series, seriesId))
+    language.key = "series:" + series;
+  return language;
+}
+
+std::optional<LanguageChoice> ChooseLanguage(const PlaybackLanguage& language, bool& remember)
+{
+  remember = false;
+  if (language.original.empty() || language.audio.empty() || language.original == language.audio)
+    return LanguageChoice::Ordinary;
+
+  const auto saved = ReadChoice(language);
+  if (saved != LanguageChoice::Ordinary)
+    return saved;
+
+  const auto value =
+      CServiceBroker::GetSettingsComponent()->GetSettings()->GetString(language.setting);
+  if (value == "sub")
+    return LanguageChoice::Sub;
+  if (value == "dub")
+    return LanguageChoice::Dub;
+
+  auto* dialog = CServiceBroker::GetGUI()->GetWindowManager().GetWindow<CGUIDialogSelect>(
+      WINDOW_DIALOG_SELECT);
+  if (!dialog)
+    return std::nullopt;
+  dialog->Reset();
+  dialog->SetHeading(CVariant{42010});
+  dialog->Add(ChoiceLabel(language, LanguageChoice::Sub));
+  dialog->Add(ChoiceLabel(language, LanguageChoice::Dub));
+  dialog->Open();
+  const int index = dialog->GetSelectedItem();
+  if (!dialog->IsConfirmed() || index < 0)
+    return std::nullopt;
+  remember = true;
+  return index == 0 ? LanguageChoice::Sub : LanguageChoice::Dub;
+}
+
+void RememberLanguageChoice(const PlaybackLanguage& language, LanguageChoice choice)
+{
+  if (!SaveChoice(language, choice))
+    CLog::Log(LOGWARNING, "Appliance: could not save the profile language choice");
+}
+
+bool EditLanguageChoice(const CFileItem& item)
+{
+  const auto title = GetTitle(item);
+  if (title.key.empty())
+    return false;
+  const auto language = GetPlaybackLanguage(title, item, LoadIndexEntry(title));
+  if (language.original.empty() || language.audio.empty() || language.original == language.audio)
+    return false;
+
+  auto* dialog = CServiceBroker::GetGUI()->GetWindowManager().GetWindow<CGUIDialogSelect>(
+      WINDOW_DIALOG_SELECT);
+  if (!dialog)
+    return false;
+  dialog->Reset();
+  dialog->SetHeading(CVariant{42014});
+  dialog->Add(ChoiceLabel(language, LanguageChoice::Sub));
+  dialog->Add(ChoiceLabel(language, LanguageChoice::Dub));
+  dialog->Add(g_localizeStrings.Get(42013));
+  const auto current = ReadChoice(language);
+  dialog->SetSelected(current == LanguageChoice::Sub ? 0 : current == LanguageChoice::Dub ? 1 : 2);
+  const auto profiles = CServiceBroker::GetSettingsComponent()->GetProfileManager();
+  const int profile = profiles->GetCurrentProfileId();
+  dialog->Open();
+  if (!dialog->IsConfirmed() || profiles->GetCurrentProfileId() != profile)
+    return false;
+  switch (dialog->GetSelectedItem())
+  {
+    case 0:
+      return SaveChoice(language, LanguageChoice::Sub);
+    case 1:
+      return SaveChoice(language, LanguageChoice::Dub);
+    case 2:
+      return SaveChoice(language, LanguageChoice::Ordinary);
+    default:
+      return false;
+  }
+}
+
+bool OfferLanguageAlternative(const PlaybackLanguage& language, LanguageChoice choice)
+{
+  auto* dialog = CServiceBroker::GetGUI()->GetWindowManager().GetWindow<CGUIDialogSelect>(
+      WINDOW_DIALOG_SELECT);
+  if (!dialog)
+    return false;
+  dialog->Reset();
+  dialog->SetHeading(CVariant{42015});
+  dialog->Add(ChoiceLabel(language, choice));
+  dialog->Open();
+  return dialog->IsConfirmed() && dialog->GetSelectedItem() == 0;
+}
+
+void SetLanguageRequirements(SelectionPreferences& preferences,
+                             const PlaybackLanguage& language,
+                             LanguageChoice choice)
+{
+  preferences.requiredAudio = choice == LanguageChoice::Sub ? language.original : language.audio;
+  if (choice == LanguageChoice::Ordinary)
+    preferences.requiredAudio.clear();
+  preferences.requiredSubtitles = choice == LanguageChoice::Sub ? language.subtitles : "";
+  preferences.fallbackSubtitles = choice == LanguageChoice::Sub ? language.audio : "";
+}
+
+bool PlaybackTracks::Matches(LanguageChoice choice) const
+{
+  return audio >= 0 && (choice != LanguageChoice::Sub || subtitle >= 0);
+}
+
+PlaybackTracks FindPlaybackTracks(CApplicationPlayer& player,
+                                  const PlaybackLanguage& language,
+                                  LanguageChoice choice)
+{
+  PlaybackTracks tracks;
+  const auto& required = choice == LanguageChoice::Sub ? language.original : language.audio;
+  const int currentAudio = player.GetAudioStream();
+  for (int i = 0, count = player.GetAudioStreamCount(); i < count; ++i)
+  {
+    AudioStreamInfo info;
+    player.GetAudioStreamInfo(i, info);
+    if (info.valid && !(info.flags & FLAG_COMMENT) && NormalizeLanguage(info.language) == required)
+    {
+      tracks.audio = i;
+      if (i == currentAudio)
+        break;
+    }
+  }
+  if (choice != LanguageChoice::Sub)
+    return tracks;
+
+  for (int i = 0, count = player.GetSubtitleCount(); i < count; ++i)
+  {
+    SubtitleStreamInfo info;
+    player.GetSubtitleStreamInfo(i, info);
+    if (!FullSubtitle(info))
+      continue;
+    const auto code = NormalizeLanguage(info.language);
+    if (code == language.subtitles)
+    {
+      tracks.subtitle = i;
+      break;
+    }
+    if (code == language.audio && tracks.subtitle < 0)
+      tracks.subtitle = i;
+  }
+  return tracks;
+}
+
+bool VerifyPlaybackTracks(CApplicationPlayer& player,
+                          const PlaybackLanguage& language,
+                          LanguageChoice choice,
+                          const PlaybackTracks& tracks)
+{
+  AudioStreamInfo audio;
+  player.GetAudioStreamInfo(CURRENT_STREAM, audio);
+  if (!audio.valid || (audio.flags & FLAG_COMMENT) ||
+      NormalizeLanguage(audio.language) !=
+          (choice == LanguageChoice::Sub ? language.original : language.audio))
+    return false;
+  if (choice == LanguageChoice::Dub)
+    return true;
+
+  SubtitleStreamInfo subtitle;
+  player.GetSubtitleStreamInfo(CURRENT_STREAM, subtitle);
+  if (!FullSubtitle(subtitle) || !player.GetSubtitleVisible())
+    return false;
+  SubtitleStreamInfo preferred;
+  player.GetSubtitleStreamInfo(tracks.subtitle, preferred);
+  return FullSubtitle(preferred) &&
+         NormalizeLanguage(subtitle.language) == NormalizeLanguage(preferred.language);
+}
+
+TitleContext GetTitleContext(const Title& title, const CFileItem& item, const CVariant& entry)
+{
+  const int64_t duration = item.HasVideoInfoTag() ? item.GetVideoInfoTag()->GetDuration() : 0;
+  const int64_t indexedDuration = std::max<int64_t>(0, ReadId(entry["runtimeSeconds"]));
+  return {title.key, std::chrono::seconds{duration > 0 ? duration : indexedDuration},
+          entry["lowMotionAnimation"].asBoolean(), entry["grainOrRestoration"].asBoolean()};
+}
+
 CVariant LoadProviders()
 {
   return ReadJson(std::string(ROOT) + "providers.json");
 }
 
-std::vector<std::string> LocalFiles(const CVariant& entry)
+std::vector<FileCandidate> LocalFiles(const CVariant& entry, const Title& title)
 {
-  std::vector<std::string> files;
+  std::vector<FileCandidate> files;
   const auto& local = entry["local"];
   if (!local.isArray())
     return files;
-  for (auto it = local.begin_array(); it != local.end_array() && files.size() < 4; ++it)
+  for (auto it = local.begin_array(); it != local.end_array(); ++it)
   {
-    const std::string path = it->asString();
+    const std::string path = it->isObject() ? (*it)["path"].asString() : it->asString();
     const CURL url(path);
-    if (path.empty() || (!url.GetProtocol().empty() && !url.IsProtocol("smb")) ||
-        (url.GetProtocol().empty() && !CURL::IsFullPath(path)) ||
-        !URIUtils::HasExtension(path, ".mkv|.mp4|.m4v|.avi|.webm|.mov|.ts|.m2ts") ||
-        std::find(files.begin(), files.end(), path) != files.end())
+    if (!IsLocalVideo(path, url))
       continue;
-    files.push_back(path);
+
+    const std::string canonical = URIUtils::GetRealPath(url.GetWithoutUserDetails());
+    FileEvidence evidence = NameEvidence((*it)["format"].asString(), false);
+    evidence.titleKey = title.key;
+    evidence.reportedBy = "local index";
+    evidence.size = FileSize::FromMemberBytes((*it)["bytes"]);
+    if ((*it)["is3D"].isBoolean())
+      evidence.is3D = (*it)["is3D"].asBoolean();
+    if ((*it)["audioLanguages"].isArray())
+      evidence.audio = VerifiedLanguages((*it)["audioLanguages"]);
+    if ((*it)["fullSubtitleLanguages"].isArray())
+      evidence.subtitles = VerifiedLanguages((*it)["fullSubtitleLanguages"]);
+    files.push_back({{Tier::Local, {}, canonical}, {}, {std::move(evidence)}, path});
   }
   return files;
 }
 
-RemoteFile SelectFile(const CVariant& files, const CVariant& entry)
+CVariant SelectFile(const CVariant& files, const CVariant& entry)
 {
-  RemoteFile selected;
+  CVariant selected;
   if (!files.isArray())
     return selected;
 
   for (auto it = files.begin_array(); it != files.end_array(); ++it)
   {
-    const CVariant& fileId = (*it)["id"];
-    const CVariant& fileSize = (*it)["size"];
-    if ((!fileId.isInteger() && !fileId.isUnsignedInteger()) ||
-        (!fileSize.isUnsignedInteger() && !(fileSize.isInteger() && fileSize.asInteger() > 0)))
+    if (ReadId((*it)["id"]) < 0 || !MatchesFile(*it, entry))
       continue;
-    const int64_t id = fileId.asInteger(-1);
-    const uint64_t bytes = fileSize.asUnsignedInteger();
-    if (id < 0 || bytes == 0 || !MatchesFile(*it, entry))
-      continue;
-    if (selected.id >= 0)
+    if (!selected.isNull())
       return {};
-    selected = {-1, id, bytes};
+    selected = *it;
   }
   return selected;
 }
 
-RemoteFile Discover(const CVariant& entry, const CVariant& providers)
+std::vector<FileCandidate> Discover(const CVariant& entry,
+                                    const CVariant& providers,
+                                    const std::string& titleKey)
 {
   const std::string fixture = providers["fixture"].asString();
   const std::string query = entry["query"].asString();
   if (query.empty())
     return {};
-  if (!fixture.empty())
-    return SelectFile(GetJson(fixture + "/discover?query=" + CURL::Encode(query)), entry);
 
-  const std::string prowlarr = providers["prowlarr"].asString();
+  const std::string prowlarr = fixture.empty() ? providers["prowlarr"].asString() : fixture;
   const std::string apiKey = providers["prowlarrKey"].asString();
   const std::string torboxKey = providers["torboxKey"].asString();
-  if (prowlarr.empty() || apiKey.empty() || torboxKey.empty())
+  if (prowlarr.empty() || (fixture.empty() && (apiKey.empty() || torboxKey.empty())))
     return {};
 
   const CVariant releases =
-      GetJson(prowlarr + "/api/v1/search?type=search&limit=50&query=" + CURL::Encode(query),
-              "X-Api-Key: " + apiKey);
+      GetJson(prowlarr + "/api/v1/search?type=search&limit=" + std::to_string(RELEASE_LIMIT) +
+                  "&query=" + CURL::Encode(query),
+              fixture.empty() ? "X-Api-Key: " + apiKey : std::string{});
   if (!releases.isArray())
     return {};
 
-  std::set<std::string> hashes;
-  for (auto it = releases.begin_array(); it != releases.end_array(); ++it)
+  std::map<std::string, std::vector<FileEvidence>> releaseEvidence;
+  for (unsigned int i = 0; i < std::min(releases.size(), RELEASE_LIMIT); ++i)
   {
-    const auto hash = InfoHash(*it);
-    if (!hash.empty())
-      hashes.insert(hash);
+    const auto& release = releases[i];
+    const auto hash = InfoHash(release);
+    if (hash.empty())
+      continue;
+    FileEvidence evidence = NameEvidence(release["title"].asString(), true);
+    evidence.reportedBy = "prowlarr";
+    evidence.size = FileSize::FromMemberBytes(release["size"]);
+    if (evidence.size.bytes)
+      evidence.size.kind = SizeKind::PackTotal;
+    releaseEvidence[hash].push_back(std::move(evidence));
   }
-  if (hashes.empty())
+  if (releaseEvidence.empty())
     return {};
 
   // shortcut: only use ready torrents already in the pilot account until cached acquisition is implemented.
   const CVariant listing =
-      GetJson(std::string(TORBOX) + "mylist?limit=200", "Authorization: Bearer " + torboxKey);
+      GetJson((fixture.empty() ? TORBOX : fixture) + std::string(TORBOX_TORRENTS) +
+                  "mylist?limit=" + std::to_string(TORRENT_LIMIT),
+              fixture.empty() ? "Authorization: Bearer " + torboxKey : std::string{});
   const CVariant& torrents = listing["data"];
   if (!listing["success"].asBoolean() || !torrents.isArray())
     return {};
 
-  for (auto it = torrents.begin_array(); it != torrents.end_array(); ++it)
+  std::vector<FileCandidate> candidates;
+  for (unsigned int i = 0; i < std::min(torrents.size(), TORRENT_LIMIT); ++i)
   {
-    const int64_t torrentId = (*it)["id"].asInteger(-1);
-    std::string hash = (*it)["hash"].asString();
-    StringUtils::ToLower(hash);
-    if (torrentId < 0 || !hashes.count(hash) || !(*it)["download_finished"].asBoolean() ||
-        !(*it)["download_present"].asBoolean())
+    const auto& torrent = torrents[i];
+    const int64_t torrentId = ReadId(torrent["id"]);
+    const std::string hash = NormalizeInfoHash(torrent["hash"].asString());
+    const auto release = releaseEvidence.find(hash);
+    if (torrentId < 0 || release == releaseEvidence.end() ||
+        !torrent["download_finished"].asBoolean() || !torrent["download_present"].asBoolean())
       continue;
 
-    RemoteFile selected = SelectFile((*it)["files"], entry);
-    if (selected.id >= 0)
+    const CVariant selected = SelectFile(torrent["files"], entry);
+    if (selected.isNull())
+      continue;
+
+    std::string member = selected["name"].asString();
+    StringUtils::Replace(member, '\\', '/');
+    FileEvidence file = NameEvidence(URIUtils::GetFileName(member), true);
+    file.reportedBy = TORBOX_PROVIDER;
+    file.titleKey = titleKey;
+    file.size = FileSize::FromMemberBytes(selected["size"]);
+    file.availability = Availability::Available;
+
+    auto evidence = release->second;
+    for (auto& report : evidence)
     {
-      selected.torrentId = torrentId;
-      return selected;
+      if (file.resolution)
+        report.resolution = 0;
+      if (!file.codec.empty())
+        report.codec.clear();
+      if (file.source != Source::Unknown)
+        report.source = Source::Unknown;
+      if (!file.hdr.empty())
+        report.hdr.clear();
     }
+    evidence.push_back(std::move(file));
+    candidates.push_back(
+        {{Tier::Remote, hash, std::move(member)},
+         {{TORBOX_PROVIDER, std::to_string(torrentId), std::to_string(ReadId(selected["id"]))}},
+         std::move(evidence)});
   }
-  return {};
+  return candidates;
 }
 
-std::string Resolve(const CVariant& entry, const CVariant& providers, const RemoteFile& file)
+std::string Resolve(const CVariant& providers, const ResolverRoute& route)
 {
-  if (file.id < 0)
+  if (route.provider != TORBOX_PROVIDER || route.torrentId.empty() || route.fileId.empty())
     return {};
 
-  std::string url;
-  if (file.torrentId < 0)
-  {
-    const std::string fixture = providers["fixture"].asString();
-    if (fixture.empty())
-      return {};
-    const CVariant response =
-        GetJson(fixture + "/resolve?query=" + CURL::Encode(entry["query"].asString()) +
-                "&file_id=" + std::to_string(file.id));
-    url = response["url"].asString();
-  }
-  else
-  {
-    const std::string key = providers["torboxKey"].asString();
-    if (key.empty())
-      return {};
-    const CVariant response = GetJson(std::string(TORBOX) + "requestdl?token=" + CURL::Encode(key) +
-                                      "&torrent_id=" + std::to_string(file.torrentId) +
-                                      "&file_id=" + std::to_string(file.id));
-    if (!response["success"].asBoolean())
-      return {};
-    url = response["data"].asString();
-    if (!CURL(url).IsProtocol("https"))
-      return {};
-  }
-  return IsHttp(CURL(url)) ? url : std::string{};
+  const std::string fixture = providers["fixture"].asString();
+  const std::string key = providers["torboxKey"].asString();
+  if (fixture.empty() && key.empty())
+    return {};
+
+  const CVariant response = GetJson(
+      (fixture.empty() ? TORBOX : fixture) + std::string(TORBOX_TORRENTS) + "requestdl?" +
+      (fixture.empty() ? "token=" + CURL::Encode(key) + "&" : std::string{}) +
+      "torrent_id=" + CURL::Encode(route.torrentId) + "&file_id=" + CURL::Encode(route.fileId));
+  if (!response["success"].asBoolean())
+    return {};
+
+  const std::string path = response["data"].asString();
+  const CURL url(path);
+  return IsHttp(url) && (!fixture.empty() || url.IsProtocol("https")) ? path : std::string{};
 }
 } // namespace KODI::APPLIANCE

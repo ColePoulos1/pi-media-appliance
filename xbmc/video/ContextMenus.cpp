@@ -23,6 +23,7 @@
 #include "utils/ExecString.h"
 #include "utils/StringUtils.h"
 #include "utils/URIUtils.h"
+#include "video/AppliancePlayback.h"
 #include "video/VideoInfoTag.h"
 #include "video/VideoManagerTypes.h"
 #include "video/VideoUtils.h"
@@ -87,6 +88,22 @@ bool CVideoRemoveResumePoint::Execute(const std::shared_ptr<CFileItem>& item) co
 {
   CVideoLibraryQueue::GetInstance().ResetResumePoint(item);
   return true;
+}
+
+bool CApplianceLanguage::IsVisible(const CFileItem& item) const
+{
+  using namespace KODI::APPLIANCE;
+  const auto title = GetTitle(item);
+  if (title.key.empty())
+    return false;
+
+  const auto language = GetPlaybackLanguage(title, item, LoadIndexEntry(title));
+  return !language.original.empty() && !language.audio.empty() && language.original != language.audio;
+}
+
+bool CApplianceLanguage::Execute(const std::shared_ptr<CFileItem>& item) const
+{
+  return KODI::APPLIANCE::EditLanguageChoice(*item);
 }
 
 bool CVideoMarkWatched::IsVisible(const CFileItem& item) const

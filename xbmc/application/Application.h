@@ -244,7 +244,10 @@ private:
   struct AppliancePlayback;
   bool PlayFileInternal(CFileItem item, const std::string& player, bool bRestart);
   void TryApplianceSource();
-  void OpenApplianceSource(const std::string& path);
+  bool OpenApplianceSource(const std::string& path);
+  void CheckApplianceTracks();
+  void RejectApplianceTracks();
+  void AnnouncePlaybackAVStart();
   void CancelAppliancePlayback();
   void PrintStartupLog();
   void ResetCurrentItem();

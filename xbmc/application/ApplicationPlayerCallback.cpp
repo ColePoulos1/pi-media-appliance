@@ -98,6 +98,10 @@ void CApplicationPlayerCallback::OnPlayBackStarted(const CFileItem& file)
 void CApplicationPlayerCallback::OnPlayerCloseFile(const CFileItem& file,
                                                    const CBookmark& bookmarkParam)
 {
+  if (file.HasProperty(KODI::APPLIANCE::LANGUAGE_CHOICE) &&
+      file.GetProperty(KODI::APPLIANCE::SOURCE_TOKEN).asInteger() != m_verifiedLanguageSource)
+    return;
+
   auto& components = CServiceBroker::GetAppComponents();
   const auto stackHelper = components.GetComponent<CApplicationStackHelper>();
 
@@ -304,11 +308,28 @@ void CApplicationPlayerCallback::RequestVideoSettings(const CFileItem& fileItem)
 }
 
 void CApplicationPlayerCallback::StoreVideoSettings(const CFileItem& fileItem,
-                                                    const CVideoSettings& vs)
+                                                    const CVideoSettings& settings)
 {
   CVideoDatabase dbs;
   if (dbs.Open())
   {
+    using namespace KODI::APPLIANCE;
+    CVideoSettings vs = settings;
+    const auto choice =
+        static_cast<LanguageChoice>(fileItem.GetProperty(LANGUAGE_CHOICE).asInteger());
+    if (choice != LanguageChoice::Ordinary)
+    {
+      CVideoSettings previous;
+      if (!dbs.GetVideoSettings(fileItem, previous))
+        previous = CMediaSettings::GetInstance().GetDefaultVideoSettings();
+      // Automatic choices use source-specific stream indices.
+      vs.m_AudioStream = previous.m_AudioStream;
+      if (choice == LanguageChoice::Sub)
+      {
+        vs.m_SubtitleStream = previous.m_SubtitleStream;
+        vs.m_SubtitleOn = previous.m_SubtitleOn;
+      }
+    }
     if (vs != CMediaSettings::GetInstance().GetDefaultVideoSettings())
     {
       dbs.SetVideoSettings(fileItem, vs);

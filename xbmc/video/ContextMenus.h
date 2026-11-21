@@ -71,6 +71,13 @@ struct CVideoRemoveResumePoint : CStaticContextMenuAction
   bool Execute(const std::shared_ptr<CFileItem>& item) const override;
 };
 
+struct CApplianceLanguage : CStaticContextMenuAction
+{
+  CApplianceLanguage() : CStaticContextMenuAction(42014) {}
+  bool IsVisible(const CFileItem& item) const override;
+  bool Execute(const std::shared_ptr<CFileItem>& item) const override;
+};
+
 struct CVideoMarkWatched : CStaticContextMenuAction
 {
   CVideoMarkWatched() : CStaticContextMenuAction(16103) {}

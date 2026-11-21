@@ -11,6 +11,8 @@
 #include "cores/IPlayerCallback.h"
 #include "threads/Event.h"
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 
 class CApplicationStackHelper;
@@ -37,4 +39,7 @@ public:
   void OnAVStarted(const CFileItem& file) override;
   void RequestVideoSettings(const CFileItem& fileItem) override;
   void StoreVideoSettings(const CFileItem& fileItem, const CVideoSettings& vs) override;
+
+protected:
+  std::atomic<int64_t> m_verifiedLanguageSource{0};
 };

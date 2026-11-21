@@ -558,6 +558,56 @@
           <control type="toggle" />
         </setting>
       </group>
+      <group id="4" label="42000">
+        <setting id="appliance.quality" type="string" label="42001" help="42017">
+          <level>0</level>
+          <default>balanced</default>
+          <constraints>
+            <options>
+              <option label="42002">balanced</option>
+              <option label="42003">high</option>
+              <option label="42004">data</option>
+            </options>
+          </constraints>
+          <control type="list" format="string" />
+        </setting>
+        <setting id="appliance.movielanguage" type="string" label="42005" help="42018">
+          <level>0</level>
+          <default>ask</default>
+          <constraints>
+            <options>
+              <option label="42007">ask</option>
+              <option label="42008">sub</option>
+              <option label="42009">dub</option>
+            </options>
+          </constraints>
+          <control type="list" format="string" />
+        </setting>
+        <setting id="appliance.tvlanguage" type="string" label="42006" help="42018">
+          <level>0</level>
+          <default>ask</default>
+          <constraints>
+            <options>
+              <option label="42007">ask</option>
+              <option label="42008">sub</option>
+              <option label="42009">dub</option>
+            </options>
+          </constraints>
+          <control type="list" format="string" />
+        </setting>
+        <setting id="appliance.animelanguage" type="string" label="42016" help="42018">
+          <level>0</level>
+          <default>ask</default>
+          <constraints>
+            <options>
+              <option label="42007">ask</option>
+              <option label="42008">sub</option>
+              <option label="42009">dub</option>
+            </options>
+          </constraints>
+          <control type="list" format="string" />
+        </setting>
+      </group>
     </category>
     <category id="subtitles" label="287" help="37033">
       <group id="1" label="39186">

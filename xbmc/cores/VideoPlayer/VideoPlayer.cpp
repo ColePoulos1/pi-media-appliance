@@ -5351,6 +5351,7 @@ void CVideoPlayer::GetSubtitleStreamInfo(int index, SubtitleStreamInfo& info) co
   }
 
   const SelectionStream& s = m_content.m_selectionStreams.Get(STREAM_SUBTITLE, index);
+  info.valid = s.type != STREAM_NONE;
   info.name = s.name;
 
   if (s.type == STREAM_NONE)

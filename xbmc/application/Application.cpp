@@ -1748,7 +1748,14 @@ void CApplication::OnApplicationMessage(ThreadMessage* pMsg)
     {
       const int profile = pMsg->param1;
       if (profile >= 0)
-        CServiceBroker::GetSettingsComponent()->GetProfileManager()->LoadProfile(static_cast<unsigned int>(profile));
+      {
+        const auto profiles = CServiceBroker::GetSettingsComponent()->GetProfileManager();
+        const auto index = static_cast<unsigned int>(profile);
+        if (m_appliancePlayback && profiles->GetProfile(index) &&
+            index != profiles->GetCurrentProfileIndex())
+          StopPlaying();
+        profiles->LoadProfile(index);
+      }
     }
 
     break;
@@ -1900,6 +1907,7 @@ void CApplication::FrameMove(bool processEvents, bool processGUI)
   }
 
   appPlayer->FrameMove();
+  CheckApplianceTracks();
 
   // this will go away when render systems gets its own thread
   CServiceBroker::GetWinSystem()->DriveRenderLoop();
@@ -2370,15 +2378,38 @@ bool CApplication::PlayStack(CFileItem& item, bool bRestart)
 
 struct CApplication::AppliancePlayback
 {
+  enum class Lookup
+  {
+    Discovered,
+    Resolved,
+    ResolveFailed
+  };
+  static constexpr unsigned int MAX_RESOLUTIONS_PER_ROUTE = 2;
+
   CFileItem title;
   CVariant entry;
-  CVariant providers;
-  std::vector<std::string> local;
+  KODI::APPLIANCE::TitleContext context;
+  KODI::APPLIANCE::PlaybackLanguage language;
+  KODI::APPLIANCE::LanguageChoice choice{KODI::APPLIANCE::LanguageChoice::Ordinary};
+  KODI::APPLIANCE::SelectionPreferences preferences;
+  std::vector<KODI::APPLIANCE::FileCandidate> localFiles;
+  std::vector<KODI::APPLIANCE::FileCandidate> remoteFiles;
+  std::vector<KODI::APPLIANCE::RankedFile> local;
   size_t nextLocal{0};
-  KODI::APPLIANCE::RemoteFile remote;
-  unsigned int resolutions{0};
+  // The discovery job publishes both values with its token-matched GUI message.
+  CVariant providers;
+  std::vector<KODI::APPLIANCE::RankedFile> remote;
+  bool discovered{false};
+  size_t nextRemote{0};
+  size_t nextRoute{0};
+  unsigned int routeResolutions{0};
   std::atomic_bool cancelled{false};
   bool avStarted{false};
+  bool alternativeAvailable{false};
+  bool alternativeOffered{false};
+  bool openingRemote{false};
+  KODI::APPLIANCE::PlaybackTracks tracks;
+  std::optional<std::chrono::steady_clock::time_point> verifyUntil;
 };
 
 bool CApplication::PlayFile(CFileItem item, const std::string& player, bool bRestart)
@@ -2387,6 +2418,7 @@ bool CApplication::PlayFile(CFileItem item, const std::string& player, bool bRes
   CancelAppliancePlayback();
   m_applianceSourceToken = 0;
   item.ClearProperty(SOURCE_TOKEN);
+  item.ClearProperty(LANGUAGE_CHOICE);
   const Title title = GetTitle(item);
   if (title.key.empty())
     return PlayFileInternal(std::move(item), player, bRestart);
@@ -2396,10 +2428,29 @@ bool CApplication::PlayFile(CFileItem item, const std::string& player, bool bRes
   item.SetDynPath({});
   item.SetContentLookup(false);
 
-  m_appliancePlayback = std::make_shared<AppliancePlayback>();
-  m_appliancePlayback->title = std::move(item);
-  m_appliancePlayback->entry = LoadIndexEntry(title);
-  m_appliancePlayback->local = LocalFiles(m_appliancePlayback->entry);
+  const auto attempt = m_appliancePlayback = std::make_shared<AppliancePlayback>();
+  attempt->title = std::move(item);
+  attempt->entry = LoadIndexEntry(title);
+  attempt->context = GetTitleContext(title, attempt->title, attempt->entry);
+  attempt->language = GetPlaybackLanguage(title, attempt->title, attempt->entry);
+  bool remember = false;
+  const auto choice = ChooseLanguage(attempt->language, remember);
+  if (attempt != m_appliancePlayback)
+    return true;
+  if (!choice)
+  {
+    CancelAppliancePlayback();
+    ResetCurrentItem();
+    PlaybackCleanup();
+    return true;
+  }
+  if (remember)
+    RememberLanguageChoice(attempt->language, *choice);
+  attempt->choice = *choice;
+  attempt->preferences.profile = GetQualityProfile();
+  SetLanguageRequirements(attempt->preferences, attempt->language, attempt->choice);
+  attempt->localFiles = LocalFiles(attempt->entry, title);
+  attempt->local = RankFiles(attempt->localFiles, attempt->context, attempt->preferences, {});
   TryApplianceSource();
   return true;
 }
@@ -2415,59 +2466,175 @@ void CApplication::CancelAppliancePlayback()
 
 void CApplication::TryApplianceSource()
 {
+  using namespace KODI::APPLIANCE;
   const auto attempt = m_appliancePlayback;
   if (!attempt)
     return;
 
-  m_applianceSourceToken = ++m_applianceSerial;
-  if (attempt->nextLocal < attempt->local.size())
+  attempt->avStarted = false;
+  attempt->verifyUntil.reset();
+  attempt->openingRemote = false;
+  while (attempt->nextLocal < attempt->local.size())
   {
-    OpenApplianceSource(attempt->local[attempt->nextLocal++]);
+    m_applianceSourceToken = ++m_applianceSerial;
+    if (OpenApplianceSource(attempt->local[attempt->nextLocal++].file.localPath))
+      return;
+  }
+
+  const int64_t token = m_applianceSourceToken = ++m_applianceSerial;
+  if (!attempt->discovered && !attempt->entry["query"].asString().empty())
+  {
+    CServiceBroker::GetJobManager()->Submit(
+        [attempt, token]()
+        {
+          if (attempt->cancelled)
+            return;
+          attempt->providers = LoadProviders();
+          attempt->remoteFiles = Discover(attempt->entry, attempt->providers, attempt->context.key);
+          if (attempt->cancelled)
+            return;
+          CGUIMessage message(GUI_MSG_APPLIANCE_SOURCE_READY, 0, 0, token,
+                              static_cast<int>(AppliancePlayback::Lookup::Discovered));
+          CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(message);
+        },
+        CJob::PRIORITY_NORMAL);
     return;
   }
 
-  if (attempt->resolutions >= 2 || attempt->entry["query"].asString().empty())
+  if (attempt->routeResolutions == AppliancePlayback::MAX_RESOLUTIONS_PER_ROUTE)
   {
+    ++attempt->nextRoute;
+    attempt->routeResolutions = 0;
+  }
+  while (attempt->nextRemote < attempt->remote.size() &&
+         attempt->nextRoute >= attempt->remote[attempt->nextRemote].file.routes.size())
+  {
+    ++attempt->nextRemote;
+    attempt->nextRoute = 0;
+  }
+  if (attempt->nextRemote == attempt->remote.size())
+  {
+    if (attempt->choice != LanguageChoice::Ordinary && !attempt->alternativeOffered)
+    {
+      const auto alternative =
+          attempt->choice == LanguageChoice::Sub ? LanguageChoice::Dub : LanguageChoice::Sub;
+      auto preferences = attempt->preferences;
+      SetLanguageRequirements(preferences, attempt->language, alternative);
+      auto local = RankFiles(attempt->localFiles, attempt->context, preferences, {});
+      auto remote = RankFiles(attempt->remoteFiles, attempt->context, preferences, {});
+      if (attempt->alternativeAvailable || HasKnownLanguage(local, preferences) ||
+          HasKnownLanguage(remote, preferences))
+      {
+        attempt->alternativeOffered = true;
+        const bool accepted = OfferLanguageAlternative(attempt->language, alternative);
+        if (attempt != m_appliancePlayback || token != m_applianceSourceToken)
+          return;
+        if (accepted)
+        {
+          attempt->choice = alternative;
+          attempt->preferences = std::move(preferences);
+          attempt->local = std::move(local);
+          attempt->remote = std::move(remote);
+          attempt->nextLocal = 0;
+          attempt->nextRemote = 0;
+          attempt->nextRoute = 0;
+          attempt->routeResolutions = 0;
+          TryApplianceSource();
+          return;
+        }
+        CancelAppliancePlayback();
+        m_applianceSourceToken = 0;
+        return;
+      }
+    }
     CancelAppliancePlayback();
-    HELPERS::ShowOKDialogText(CVariant{16026}, CVariant{16027});
+    m_applianceSourceToken = 0;
+    HELPERS::ShowOKDialogText(
+        CVariant{16026}, CVariant{attempt->choice == LanguageChoice::Ordinary ? 16027 : 42019});
     return;
   }
 
-  const bool discover = attempt->resolutions++ == 0;
-  const int64_t token = m_applianceSourceToken;
+  ++attempt->routeResolutions;
+  const auto route = attempt->remote[attempt->nextRemote].file.routes[attempt->nextRoute];
   CServiceBroker::GetJobManager()->Submit(
-      [attempt, discover, token]()
+      [attempt, route, token]()
       {
         if (attempt->cancelled)
           return;
-        if (discover)
-        {
-          attempt->providers = KODI::APPLIANCE::LoadProviders();
-          attempt->remote = KODI::APPLIANCE::Discover(attempt->entry, attempt->providers);
-        }
+        const std::string path = Resolve(attempt->providers, route);
         if (attempt->cancelled)
           return;
-        const std::string path =
-            KODI::APPLIANCE::Resolve(attempt->entry, attempt->providers, attempt->remote);
-        if (attempt->cancelled)
-          return;
-        auto result = std::make_shared<CFileItem>(attempt->title);
-        result->SetDynPath(path);
-        CGUIMessage message(GUI_MSG_APPLIANCE_SOURCE_READY, 0, 0, token, !path.empty(), result);
+        const auto outcome = path.empty() ? AppliancePlayback::Lookup::ResolveFailed
+                                          : AppliancePlayback::Lookup::Resolved;
+        CGUIMessage message(GUI_MSG_APPLIANCE_SOURCE_READY, 0, 0, token, static_cast<int>(outcome));
+        message.SetStringParam(path);
         CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(message);
       },
       CJob::PRIORITY_NORMAL);
 }
 
-void CApplication::OpenApplianceSource(const std::string& path)
+bool CApplication::OpenApplianceSource(const std::string& path)
 {
   CFileItem item{m_appliancePlayback->title};
   item.SetDynPath(path);
   const std::string mime = CMime::GetMimeType(URIUtils::GetExtension(path));
   item.SetMimeType(mime.empty() ? "application/octet-stream" : mime);
   item.SetProperty(KODI::APPLIANCE::SOURCE_TOKEN, m_applianceSourceToken);
-  if (!PlayFileInternal(std::move(item), "VideoPlayer", false))
-    TryApplianceSource();
+  if (m_appliancePlayback->choice != KODI::APPLIANCE::LanguageChoice::Ordinary)
+    item.SetProperty(KODI::APPLIANCE::LANGUAGE_CHOICE,
+                     static_cast<int>(m_appliancePlayback->choice));
+  return PlayFileInternal(std::move(item), "VideoPlayer", false);
+}
+
+void CApplication::CheckApplianceTracks()
+{
+  using namespace KODI::APPLIANCE;
+  const auto attempt = m_appliancePlayback;
+  if (!attempt || !attempt->verifyUntil)
+    return;
+
+  const auto player = GetComponent<CApplicationPlayer>();
+  if (VerifyPlaybackTracks(*player, attempt->language, attempt->choice, attempt->tracks))
+  {
+    attempt->verifyUntil.reset();
+    m_verifiedLanguageSource = m_applianceSourceToken;
+    attempt->avStarted = true;
+    AnnouncePlaybackAVStart();
+  }
+  else if (std::chrono::steady_clock::now() >= *attempt->verifyUntil)
+    RejectApplianceTracks();
+}
+
+void CApplication::AnnouncePlaybackAVStart()
+{
+  CVariant param;
+  param["player"]["speed"] = 1;
+  param["player"]["playerid"] = CServiceBroker::GetPlaylistPlayer().GetCurrentPlaylist();
+  CServiceBroker::GetAnnouncementManager()->Announce(ANNOUNCEMENT::Player, "OnAVStart",
+                                                     m_itemCurrentFile, param);
+  m_playerEvent.Set();
+#ifdef HAS_PYTHON
+  CServiceBroker::GetXBPython().OnAVStarted(*m_itemCurrentFile);
+#endif
+}
+
+void CApplication::RejectApplianceTracks()
+{
+  const auto attempt = m_appliancePlayback;
+  CLog::Log(LOGDEBUG, "Appliance: source did not supply the selected language tracks");
+  attempt->verifyUntil.reset();
+  m_applianceSourceToken = 0;
+  GetComponent<CApplicationPlayer>()->ClosePlayer();
+  m_playerEvent.Set();
+  ResetCurrentItem();
+  PlaybackCleanup();
+  if (attempt->openingRemote)
+  {
+    ++attempt->nextRemote;
+    attempt->nextRoute = 0;
+    attempt->routeResolutions = 0;
+  }
+  TryApplianceSource();
 }
 
 bool CApplication::PlayFileInternal(CFileItem item, const std::string& player, bool bRestart)
@@ -2822,19 +2989,33 @@ bool CApplication::OnMessage(CGUIMessage& message)
   case GUI_MSG_APPLIANCE_SOURCE_READY:
     if (m_appliancePlayback && message.GetParam1AsI64() == m_applianceSourceToken)
     {
-      if (message.GetParam2())
+      const auto outcome = static_cast<AppliancePlayback::Lookup>(message.GetParam2());
+      if (outcome == AppliancePlayback::Lookup::Resolved)
       {
-        CLog::Log(LOGDEBUG, "Appliance: selected remote file has {} bytes",
-                  m_appliancePlayback->remote.bytes);
-        OpenApplianceSource(std::static_pointer_cast<CFileItem>(message.GetItem())->GetDynPath());
+        m_appliancePlayback->openingRemote = true;
+        uint64_t exactBytes = 0;
+        const auto& file = m_appliancePlayback->remote[m_appliancePlayback->nextRemote].file;
+        for (const auto& report : file.evidence)
+        {
+          if (report.size.kind == KODI::APPLIANCE::SizeKind::Exact)
+            exactBytes = std::max(exactBytes, report.size.bytes);
+        }
+        if (exactBytes)
+          CLog::Log(LOGDEBUG, "Appliance: selected remote file has {} bytes", exactBytes);
+        if (OpenApplianceSource(message.GetStringParam()))
+          return true;
       }
-      else if (m_appliancePlayback->remote.id >= 0)
-        TryApplianceSource();
-      else
+      else if (outcome == AppliancePlayback::Lookup::Discovered)
       {
-        CancelAppliancePlayback();
-        HELPERS::ShowOKDialogText(CVariant{16026}, CVariant{16027});
+        m_appliancePlayback->discovered = true;
+        m_appliancePlayback->remote = KODI::APPLIANCE::RankFiles(
+            m_appliancePlayback->remoteFiles, m_appliancePlayback->context,
+            m_appliancePlayback->preferences, {});
       }
+      else if (outcome == AppliancePlayback::Lookup::ResolveFailed)
+        m_appliancePlayback->routeResolutions = AppliancePlayback::MAX_RESOLUTIONS_PER_ROUTE;
+
+      TryApplianceSource();
     }
     return true;
 
@@ -3143,23 +3324,43 @@ bool CApplication::OnMessage(CGUIMessage& message)
 
   case GUI_MSG_PLAYBACK_AVSTARTED:
   {
+    using namespace KODI::APPLIANCE;
     const int64_t token = message.GetParam1AsI64();
     if (token && token != m_applianceSourceToken)
       return true;
     if (token && m_appliancePlayback)
-      m_appliancePlayback->avStarted = true;
-
-    CVariant param;
-    param["player"]["speed"] = 1;
-    param["player"]["playerid"] = CServiceBroker::GetPlaylistPlayer().GetCurrentPlaylist();
-    CServiceBroker::GetAnnouncementManager()->Announce(ANNOUNCEMENT::Player, "OnAVStart",
-                                                       m_itemCurrentFile, param);
-    m_playerEvent.Set();
-#ifdef HAS_PYTHON
-    // informs python script currently running playback has started
-    // (does nothing if python is not loaded)
-    CServiceBroker::GetXBPython().OnAVStarted(*m_itemCurrentFile);
-#endif
+    {
+      const auto attempt = m_appliancePlayback;
+      if (attempt->avStarted || attempt->verifyUntil)
+        return true;
+      if (attempt->choice != LanguageChoice::Ordinary)
+      {
+        const auto player = GetComponent<CApplicationPlayer>();
+        const auto alternative =
+            attempt->choice == LanguageChoice::Sub ? LanguageChoice::Dub : LanguageChoice::Sub;
+        attempt->alternativeAvailable |=
+            FindPlaybackTracks(*player, attempt->language, alternative).Matches(alternative);
+        attempt->tracks = FindPlaybackTracks(*player, attempt->language, attempt->choice);
+        if (!attempt->tracks.Matches(attempt->choice))
+        {
+          RejectApplianceTracks();
+          return true;
+        }
+        if (player->GetAudioStream() != attempt->tracks.audio)
+          player->SetAudioStream(attempt->tracks.audio);
+        if (attempt->choice == LanguageChoice::Sub)
+        {
+          if (player->GetSubtitle() != attempt->tracks.subtitle)
+            player->SetSubtitle(attempt->tracks.subtitle);
+          player->SetSubtitleVisible(true);
+        }
+        attempt->verifyUntil = std::chrono::steady_clock::now() + 2s;
+        CheckApplianceTracks();
+        return true;
+      }
+      attempt->avStarted = true;
+    }
+    AnnouncePlaybackAVStart();
     return true;
   }
 
