@@ -33,6 +33,8 @@ The legacy index and seeded library scenarios passed. The baseline exercised loc
 
 The [provider evaluation](m4-provider-evaluation.md) records the four candidates, public endpoint checks and operator and credential constraints. BitSearch is the first candidate for matched coverage testing because its direct API offers keyless access. The next open question is how many of the owner's Fen-playable movies and episodes an eligible candidate can play and whether its operator permits the shipped use. Compare both setups on the agreed private sample using the same TorBox account, with the owner's server unavailable to the appliance and Prowlarr unconfigured on it.
 
+**22 November 2026 · Coverage target and starting sample supplied.** The owner wants approximately 90% coverage of Fen-playable titles, measured separately for movies and episodes. Extremely niche, extremely old and foreign titles other than anime are lower priority. The private starting sample and permission to add cases are recorded in `C:/Code/artifacts/pi-media-provider-sample.txt`, outside Git. Verify the supplied anime case's catalog identity and add enough cases to make the comparison meaningful. The provider comparison and operator permission remain open.
+
 The fork stays public. The owner supplied a TMDB API key from a dedicated disposable account with no other services linked. The workstation stores it as `TMDB_API_KEY` in the Git-ignored root `.env`. Confirmation that the registration covers the intended distribution, confirmation of the bundled read-token model, and fresh-image catalog lookup are pending. The evaluation records the applicable attribution and cache terms.
 
 ### M4 point 4 desktop acceptance
