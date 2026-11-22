@@ -6,7 +6,7 @@
 
 Follow the [Milestone 4 implementation plan](milestone-4.md) from appliance checkpoint `bbc6136a7f25e96d44dd65e8d67bc01282e247e5`. Start with a fresh profile and prove that one indexed local title reaches the existing player from the fixed Home screen. Evaluate release discovery against the owner's Fen Light+ movie and episode coverage alongside that slice. Evaluate Torrentio, BitSearch, MediaFusion and Comet first. The default must work with Prowlarr unconfigured and the owner’s home server offline. The owner chose to include a project TMDB credential in the non-commercial image for trusted friends. The plan identifies the desktop checks, the clean-account test and the physical Pi run needed to accept the milestone.
 
-**21 November 2026 · Point 1 passed on desktop.** The fixed Home screen can import and play a local movie on a fresh profile. Point 2 has a documented shortlist and workstation preflight. Default-provider selection and TMDB registration remain open. The saved M3 images and outstanding physical checks remain the hardware baselines.
+**21 November 2026 · Point 1 passed on desktop.** The fixed Home screen can import and play a local movie on a fresh profile. Point 2 has a documented shortlist and workstation preflight. The owner supplied a TMDB API key for local development. Default-provider selection and verification of the TMDB distribution model remain open. The saved M3 images and outstanding physical checks remain the hardware baselines.
 
 ### M4 point 1 desktop evidence
 
@@ -33,7 +33,7 @@ The legacy index and seeded library scenarios passed. The baseline exercised loc
 
 The [provider evaluation](m4-provider-evaluation.md) records the four candidates, public endpoint checks and operator and credential constraints. BitSearch is the first candidate for matched coverage testing because its direct API offers keyless access. The next open question is how many of the owner's Fen-playable movies and episodes an eligible candidate can play and whether its operator permits the shipped use. Compare both setups on the agreed private sample using the same TorBox account, with the owner's server unavailable to the appliance and Prowlarr unconfigured on it.
 
-TMDB's API settings and request form require an authenticated account. Registration, confirmation of the bundled read-token model, and fresh-image catalog lookup are pending. The evaluation records the applicable attribution and cache terms. M4 points 3 through 7 remain open.
+The fork stays public. The owner supplied a TMDB API key from a dedicated disposable account with no other services linked. The workstation stores it as `TMDB_API_KEY` in the Git-ignored root `.env`. Confirmation that the registration covers the intended distribution, confirmation of the bundled read-token model, and fresh-image catalog lookup are pending. The evaluation records the applicable attribution and cache terms. M4 points 3 through 7 remain open.
 
 ## Milestone 3 baseline
 
@@ -268,7 +268,7 @@ Time discovery and each route resolution separately from Play to the first visib
 | Control appliance | Stock [LibreELEC Pi 5 image](https://libreelec.tv/downloads/raspberry/) on a spare microSD. Record the owner's running version separately. Keep that working card available for comparisons. |
 | Reference behavior | Fen Light+ 2.5.4 was inspected at [8941503](https://github.com/thejason40/FenLightPlus/tree/89415039efee51fb0718278fac8a9aba3e5f0897). Under `plugin.video.fenlight/resources/lib/`, `modules/sources.py` handles discovery/filtering/resolution, `modules/player.py` tracks progress, `scrapers/tb_cloud.py` and `scrapers/external.py` obtain size data. External pack values may be estimates, while TorBox may expose individual file bytes. |
 
-The [project fork](https://github.com/ColePoulos1/pi-media-appliance) owns application code and the pins/patches needed to package it. Push product work to its `appliance` branch. The upstream repository is [xbmc/xbmc](https://github.com/xbmc/xbmc). Maintain a small set of LibreELEC recipe/overlay changes when packaging work starts. Keep kernel, firmware and board packages tracking LibreELEC. The native/libVLC path is an independent experiment.
+The public project fork owns application code and the pins/patches needed to package it. Push product work to its `appliance` branch. Keep API keys and account credentials outside Git. Maintain a small set of LibreELEC recipe/overlay changes when packaging work starts. Keep kernel, firmware and board packages tracking LibreELEC. The native/libVLC path is an independent experiment. [Project fork](https://github.com/ColePoulos1/pi-media-appliance) · [Upstream Kodi](https://github.com/xbmc/xbmc)
 
 ## Build and orient
 

@@ -99,6 +99,7 @@ cmake_install.cmake
 /nbproject
 
 # /
+/.env
 /kodi.log
 /kodi.old.log
 /kodi.bin
