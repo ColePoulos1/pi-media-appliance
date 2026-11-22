@@ -2,7 +2,40 @@
 
 **21 November 2026 · Milestone 3 desktop acceptance passed.** The selector, language, recovery and scanned-library checks passed. The [point 5 evidence](#point-5-desktop-acceptance) records the desktop runs. The [M2 and M3 hardware records](#point-5-pi-5-records) track separate physical runs, including boot, provider playback, TV remote, iOS and Pi performance.
 
-## Start Milestone 3
+## Start Milestone 4
+
+Follow the [Milestone 4 implementation plan](milestone-4.md) from appliance checkpoint `bbc6136a7f25e96d44dd65e8d67bc01282e247e5`. Start with a fresh profile and prove that one indexed local title reaches the existing player from the fixed Home screen. Evaluate release discovery against the owner's Fen Light+ movie and episode coverage alongside that slice. Evaluate Torrentio, BitSearch, MediaFusion and Comet first. The default must work with Prowlarr unconfigured and the owner’s home server offline. The owner chose to include a project TMDB credential in the non-commercial image for trusted friends. The plan identifies the desktop checks, the clean-account test and the physical Pi run needed to accept the milestone.
+
+**21 November 2026 · Point 1 passed on desktop.** The fixed Home screen can import and play a local movie on a fresh profile. Point 2 has a documented shortlist and workstation preflight. Default-provider selection and TMDB registration remain open. The saved M3 images and outstanding physical checks remain the hardware baselines.
+
+### M4 point 1 desktop evidence
+
+Tested product and fixture revision `65d8d6df31e352dcb80a33002ab67864ac17b26f` (tree `0c2fc1d8323ceee430327bc6193cb706d9eae894`) on the [M3 desktop build environment](#point-5-desktop-acceptance). The M4 fixture starts with empty appliance userdata and generates one 40-second movie and its sidecar NFO in a disposable Linux `HOME`. Use the profile's [JSON-RPC and bookmark settings](#milestone-2-pilot-configuration-and-checks). Start `/appliance-build/kodi-x11 --windowing=x11` with `KODI_HOME` and `KODI_BIN_HOME` pointing at `/appliance-build` and `KODI_DATA` pointing at each disposable profile's parent of `userdata`. The GUI runs used software OpenGL and `xvfb-run -a -s '-screen 0 1280x720x24'`. The seeded library run used `AE_SINK=ALSA` with `pcm.!default { type null }` in its disposable `$HOME/.asoundrc`.
+
+```sh
+cmake --build /appliance-build --target kodi-test kodi-x11 -j 7
+(cd /appliance-build && ./kodi-test --gtest_filter='TestAppliancePlayback.*:TestFile.Read')
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$home_userdata" --port 19117 --home-phase first
+# Restart Kodi with the same HOME and KODI_DATA.
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$home_userdata" --port 19117 --home-phase restart
+# Use separate disposable profiles for the existing checks.
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$baseline_userdata" --port 19107 --measure-frames
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$library_userdata" --port 19106 --library-phase first
+# Restart Kodi with the same library profile.
+python3 -B -u /src/docs/appliance/test_appliance_playback.py "$library_userdata" --port 19106 --library-phase restart
+```
+
+All 15 focused unit tests passed. The new fixture used arrow, OK and Back actions through local-only setup, the empty Continue Watching screen, Settings, the folder browser, the on-screen Search keyboard and the title detail. Kodi created the per-title index row, anchor and video library record. Back from detail restored the result focus. After restart, adding the same folder preserved the library ID, local association and bookmark. Continue Watching resumed within two seconds of the saved position. The loopback provider received zero requests on Play, Resume, missing-file exhaustion and Retry. The ordinary file then played through Kodi's normal entry point.
+
+The legacy index and seeded library scenarios passed. The baseline exercised local-first, silent SMB fallback, exact pack member selection, link refresh, alternate routes, cooldown, resume and cancellation. The seeded movie and episode retained their source, language and title bookmarks across restart via library ID, detail, Favorites and Continue Watching. The new folder importer handles top-level local movies with adjacent NFOs containing explicit TMDB IDs. Full folder management and indexing are in [point 4](milestone-4.md#4-complete-catalog-search-folder-indexing-and-settings). Pi 5 boot, physical CEC and hardware playback remain unmeasured for this slice.
+
+### M4 point 2 dependency status
+
+The [provider evaluation](m4-provider-evaluation.md) records the four candidates, public endpoint checks and operator and credential constraints. BitSearch is the first candidate for matched coverage testing because its direct API offers keyless access. The next open question is how many of the owner's Fen-playable movies and episodes an eligible candidate can play and whether its operator permits the shipped use. Compare both setups on the agreed private sample using the same TorBox account, with the owner's server unavailable to the appliance and Prowlarr unconfigured on it.
+
+TMDB's API settings and request form require an authenticated account. Registration, confirmation of the bundled read-token model, and fresh-image catalog lookup are pending. The evaluation records the applicable attribution and cache terms. M4 points 3 through 7 remain open.
+
+## Milestone 3 baseline
 
 Use the existing `C:/Code/pi-media-appliance` checkout and its local `appliance` branch. Treat the [Milestone 2 desktop behavior](#milestone-2-desktop-evidence) as the baseline for implementation. Synthetic fixtures and desktop Kodi are enough to start. The owner copied the entire `artifacts/pi-media-m2` folder to a separate local folder for the deferred Pi test.
 
@@ -235,7 +268,7 @@ Time discovery and each route resolution separately from Play to the first visib
 | Control appliance | Stock [LibreELEC Pi 5 image](https://libreelec.tv/downloads/raspberry/) on a spare microSD. Record the owner's running version separately. Keep that working card available for comparisons. |
 | Reference behavior | Fen Light+ 2.5.4 was inspected at [8941503](https://github.com/thejason40/FenLightPlus/tree/89415039efee51fb0718278fac8a9aba3e5f0897). Under `plugin.video.fenlight/resources/lib/`, `modules/sources.py` handles discovery/filtering/resolution, `modules/player.py` tracks progress, `scrapers/tb_cloud.py` and `scrapers/external.py` obtain size data. External pack values may be estimates, while TorBox may expose individual file bytes. |
 
-The [public project fork](https://github.com/ColePoulos1/pi-media-appliance) owns application code and the pins/patches needed to package it. Push product work to its `appliance` branch. The upstream repository is [xbmc/xbmc](https://github.com/xbmc/xbmc). Maintain a small set of LibreELEC recipe/overlay changes when packaging work starts. Keep kernel, firmware and board packages tracking LibreELEC. The native/libVLC path is an independent experiment.
+The [project fork](https://github.com/ColePoulos1/pi-media-appliance) owns application code and the pins/patches needed to package it. Push product work to its `appliance` branch. The upstream repository is [xbmc/xbmc](https://github.com/xbmc/xbmc). Maintain a small set of LibreELEC recipe/overlay changes when packaging work starts. Keep kernel, firmware and board packages tracking LibreELEC. The native/libVLC path is an independent experiment.
 
 ## Build and orient
 
@@ -256,7 +289,7 @@ cd LibreELEC.tv
 PROJECT=RPi DEVICE=RPi5 ARCH=aarch64 make image
 ```
 
-Look in `target/` for the Pi 5 flash image and update artifact. Building stock is a toolchain check. To build the fork, point the Kodi recipe at this repository's public source archive for an exact commit, update its SHA-256, and retain the Pi patches. Route updates to matching project builds and keep persistent data under `/storage`. Capture the exact build command and hashes once a derivative is produced. [LibreELEC update formats](https://wiki.libreelec.tv/support/update)
+Look in `target/` for the Pi 5 flash image and update artifact. Building stock is a toolchain check. To build the fork, point the Kodi recipe at a source archive of the exact fork commit served to the builder as in M3, update its SHA-256, and retain the Pi patches. Route updates to matching project builds and keep persistent data under `/storage`. Capture the exact build command and hashes once a derivative is produced. [LibreELEC update formats](https://wiki.libreelec.tv/support/update)
 
 ## Source map for the first change
 
@@ -273,7 +306,7 @@ Look in `target/` for the Pi 5 flash image and update artifact. Building stock i
 1. **Baseline and trace.** With one movie and one episode from a season pack, record versions, runtime units, displayed and selected-file bytes, discovery source, chosen tracks, final file and playback result. Compare stock browsing/playback on direct HDMI and, if available, an HDR TV/receiver. Record compressed image size, installed space, boot-to-Home and memory. Use local private evidence for the existing personal setup and publish only redacted or synthetic data. On desktop, trace TV Play, favorites and iOS Play into the player and the bookmark write. Deliver a reproducible trace and first failing test for either local-first or Stop/error behavior.
 2. **Prove one title end to end. Provisionally accepted for development.** Add stable movie/episode identity, a local index and a single Play entry point. Start with a synthetic discovery adapter and move to Prowlarr + TorBox. Use exact per-file metadata for a packed episode. Demonstrate zero resolver/discovery requests on a local hit, a bounded disconnected-share timeout, expiration of a remote link and preserved progress across distinct files. The live Pi run is deferred.
 3. **Complete the selection contract.** Implement the three profiles, language selection, cancellation, scoped retry/skip, midstream recovery and resume. Run the [acceptance examples](stream-selection.md#acceptance-examples). Collect rank-only p95 and incremental RAM independently from provider and playback latency.
-4. **Make the fork an appliance.** Ship fixed Home, optional folder/indexer settings, local-only mode, Wi-Fi and TorBox device authorization. Select and validate a default discovery adapter against representative releases. Run without Prowlarr or the owner's NAS on a fresh household network. Validate authenticated iOS control and TV-remote-only setup.
+4. **[Make the fork an appliance](milestone-4.md).** Ship fixed Home, optional folder/indexer settings, local-only mode, Wi-Fi and TorBox device authorization. Select and validate a default discovery adapter against representative releases. Run on a fresh household network with Prowlarr unconfigured and the owner’s home server and NAS unavailable. Validate authenticated iOS control and TV-remote-only setup.
 5. **Package and test the handoff to a friend.** Produce a pinned flash image and update. A new viewer flashes, configures only network/account, finds a movie and an episode, resumes, and tries an alternative using the TV remote. Upgrade with existing favorites, settings and bookmarks. Test recovery using a spare card. Record measured deltas and remaining issues before calling the image ready.
 
 ## Acceptance evidence to keep
