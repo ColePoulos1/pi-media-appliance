@@ -564,6 +564,47 @@
           <default>false</default>
           <control type="toggle" />
         </setting>
+        <setting id="appliance.streamsize" type="string" label="42046">
+          <level>4</level>
+          <default>0</default>
+          <constraints>
+            <options>
+              <option label="42049">0</option>
+              <option label="42050">2</option>
+              <option label="42051">5</option>
+              <option label="42052">10</option>
+              <option label="42053">20</option>
+            </options>
+          </constraints>
+          <control type="list" format="string" />
+        </setting>
+        <setting id="appliance.bandwidth" type="string" label="42047">
+          <level>4</level>
+          <default>0</default>
+          <constraints>
+            <options>
+              <option label="42049">0</option>
+              <option label="42054">5</option>
+              <option label="42055">10</option>
+              <option label="42056">25</option>
+              <option label="42057">50</option>
+            </options>
+          </constraints>
+          <control type="list" format="string" />
+        </setting>
+        <setting id="appliance.maxresolution" type="string" label="42048">
+          <level>4</level>
+          <default>0</default>
+          <constraints>
+            <options>
+              <option label="42058">0</option>
+              <option label="42059">720</option>
+              <option label="42060">1080</option>
+              <option label="42061">2160</option>
+            </options>
+          </constraints>
+          <control type="list" format="string" />
+        </setting>
         <setting id="appliance.quality" type="string" label="42001" help="42017">
           <level>0</level>
           <default>balanced</default>

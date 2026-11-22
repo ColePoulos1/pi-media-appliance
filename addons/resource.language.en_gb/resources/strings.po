@@ -23966,15 +23966,208 @@ msgid "Partially watched titles will appear here."
 msgstr ""
 
 msgctxt "#42030"
-msgid "Looking for movies in the selected folder…"
+msgid "Looking for movies and episodes in the selected folder…"
 msgstr ""
 
 msgctxt "#42031"
-msgid "No movies could be added. Each movie needs an NFO with a TMDB ID."
+msgid "No titles were added. Check the folder connection or review its unmatched files."
 msgstr ""
 
 msgctxt "#42032"
 msgid "Changes could not be saved. Try again."
+msgstr ""
+
+msgctxt "#42033"
+msgid "TorBox account"
+msgstr ""
+
+msgctxt "#42034"
+msgid "Link TorBox on your phone"
+msgstr ""
+
+msgctxt "#42035"
+msgid "Enter TorBox API key"
+msgstr ""
+
+msgctxt "#42036"
+msgid "Unlink TorBox and use local media"
+msgstr ""
+
+msgctxt "#42037"
+msgid "Contacting TorBox…"
+msgstr ""
+
+msgctxt "#42038"
+msgid "TorBox could not verify the key. Check your connection and key, then try again."
+msgstr ""
+
+msgctxt "#42039"
+msgid "Network"
+msgstr ""
+
+msgctxt "#42040"
+msgid "TorBox authorization could not continue. Check your connection and try again."
+msgstr ""
+
+msgctxt "#42041"
+msgid "Open {} on your phone and enter code {}."
+msgstr ""
+
+msgctxt "#42042"
+msgid "The code expired. Link TorBox again to get a new code."
+msgstr ""
+
+msgctxt "#42043"
+msgid "The code was already collected. Link TorBox again to get a new code."
+msgstr ""
+
+msgctxt "#42044"
+msgid "TorBox is limiting requests. Wait and try again."
+msgstr ""
+
+msgctxt "#42045"
+msgid "Advanced playback settings"
+msgstr ""
+
+msgctxt "#42046"
+msgid "Maximum stream file size"
+msgstr ""
+
+msgctxt "#42047"
+msgid "Maximum average stream bitrate"
+msgstr ""
+
+msgctxt "#42048"
+msgid "Maximum device resolution"
+msgstr ""
+
+msgctxt "#42049"
+msgid "Unlimited"
+msgstr ""
+
+msgctxt "#42050"
+msgid "2 GB"
+msgstr ""
+
+msgctxt "#42051"
+msgid "5 GB"
+msgstr ""
+
+msgctxt "#42052"
+msgid "10 GB"
+msgstr ""
+
+msgctxt "#42053"
+msgid "20 GB"
+msgstr ""
+
+msgctxt "#42054"
+msgid "5 Mbps"
+msgstr ""
+
+msgctxt "#42055"
+msgid "10 Mbps"
+msgstr ""
+
+msgctxt "#42056"
+msgid "25 Mbps"
+msgstr ""
+
+msgctxt "#42057"
+msgid "50 Mbps"
+msgstr ""
+
+msgctxt "#42058"
+msgid "Automatic"
+msgstr ""
+
+msgctxt "#42059"
+msgid "720p"
+msgstr ""
+
+msgctxt "#42060"
+msgid "1080p"
+msgstr ""
+
+msgctxt "#42061"
+msgid "2160p"
+msgstr ""
+
+msgctxt "#42062"
+msgid "Searching the online catalog…"
+msgstr ""
+
+msgctxt "#42063"
+msgid "The catalog details could not be opened. Try again."
+msgstr ""
+
+msgctxt "#42064"
+msgid "Rescan folder"
+msgstr ""
+
+msgctxt "#42065"
+msgid "Remove folder"
+msgstr ""
+
+msgctxt "#42066"
+msgid "Unmatched files"
+msgstr ""
+
+msgctxt "#42067"
+msgid "Match to a library title"
+msgstr ""
+
+msgctxt "#42068"
+msgid "Add a title to the library before matching this file."
+msgstr ""
+
+msgctxt "#42069"
+msgid "Prowlarr"
+msgstr ""
+
+msgctxt "#42070"
+msgid "Prowlarr address (leave empty to disable)"
+msgstr ""
+
+msgctxt "#42071"
+msgid "Prowlarr API key"
+msgstr ""
+
+msgctxt "#42072"
+msgid "Enter a valid Prowlarr address and API key."
+msgstr ""
+
+msgctxt "#42073"
+msgid "Official Kodi Remote for iOS"
+msgstr ""
+
+msgctxt "#42074"
+msgid "Show connection details"
+msgstr ""
+
+msgctxt "#42075"
+msgid "Enable iOS remote"
+msgstr ""
+
+msgctxt "#42076"
+msgid "Replace remote password"
+msgstr ""
+
+msgctxt "#42077"
+msgid "Disable iOS remote"
+msgstr ""
+
+msgctxt "#42078"
+msgid "Connect to the household network before enabling the remote."
+msgstr ""
+
+#. Host, port, username and password for manual setup in Official Kodi Remote
+msgctxt "#42079"
+msgid "Host {}\nPort {}\nUsername {}\nPassword {}"
+msgstr ""
+
+msgctxt "#42080"
+msgid "Skip for now"
 msgstr ""
 
 #. Generic video versions label (plural)

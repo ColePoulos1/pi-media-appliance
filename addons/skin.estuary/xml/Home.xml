@@ -13,13 +13,28 @@
 				<font>font45</font>
 				<label>$LOCALIZE[10000]</label>
 			</control>
-			<control type="button" id="10">
+			<control type="grouplist" id="18">
 				<top>125</top>
 				<width>420</width>
-				<height>76</height>
-				<textoffsetx>20</textoffsetx>
-				<label>$LOCALIZE[42024]</label>
-				<visible>!String.IsEqual(Window.Property(ApplianceLocalOnly),true)</visible>
+				<height>300</height>
+				<itemgap>12</itemgap>
+				<visible>!String.IsEqual(Window.Property(ApplianceSetupComplete),true)</visible>
+				<control type="button" id="10">
+					<height>76</height>
+					<textoffsetx>20</textoffsetx>
+					<label>$LOCALIZE[42024]</label>
+				</control>
+				<control type="button" id="16">
+					<height>76</height>
+					<textoffsetx>20</textoffsetx>
+					<label>$LOCALIZE[42033]</label>
+				</control>
+				<control type="button" id="17">
+					<height>76</height>
+					<textoffsetx>20</textoffsetx>
+					<label>$LOCALIZE[42039]</label>
+					<visible>String.IsEqual(Window.Property(ApplianceNetworkSettings),true)</visible>
+				</control>
 			</control>
 			<control type="grouplist" id="15">
 				<top>125</top>
@@ -27,7 +42,7 @@
 				<height>410</height>
 				<itemgap>12</itemgap>
 				<onright>20</onright>
-				<visible>String.IsEqual(Window.Property(ApplianceLocalOnly),true)</visible>
+				<visible>String.IsEqual(Window.Property(ApplianceSetupComplete),true)</visible>
 				<control type="button" id="11">
 					<height>76</height>
 					<textoffsetx>20</textoffsetx>
@@ -72,9 +87,17 @@
 				<height>640</height>
 				<onleft>15</onleft>
 				<itemlayout width="1100" height="80">
-					<control type="label">
+					<control type="image">
 						<left>20</left>
-						<width>1060</width>
+						<top>6</top>
+						<width>68</width>
+						<height>68</height>
+						<aspectratio>keep</aspectratio>
+						<texture fallback="DefaultVideo.png">$INFO[ListItem.Icon]</texture>
+					</control>
+					<control type="label">
+						<left>106</left>
+						<width>974</width>
 						<height>80</height>
 						<label>$INFO[ListItem.Label]</label>
 					</control>
@@ -86,9 +109,17 @@
 						<texture colordiffuse="button_focus">lists/focus.png</texture>
 						<visible>Control.HasFocus(20)</visible>
 					</control>
-					<control type="label">
+					<control type="image">
 						<left>20</left>
-						<width>1060</width>
+						<top>6</top>
+						<width>68</width>
+						<height>68</height>
+						<aspectratio>keep</aspectratio>
+						<texture fallback="DefaultVideo.png">$INFO[ListItem.Icon]</texture>
+					</control>
+					<control type="label">
+						<left>106</left>
+						<width>974</width>
 						<height>80</height>
 						<label>$INFO[ListItem.Label]</label>
 					</control>

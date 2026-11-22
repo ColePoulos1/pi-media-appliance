@@ -29,6 +29,14 @@
 				<height>24</height>
 				<info>System.Progressbar</info>
 			</control>
+			<control type="image">
+				<left>925</left>
+				<top>82</top>
+				<width>232</width>
+				<height>232</height>
+				<texture>ApplianceTorBoxQR.png</texture>
+				<visible>String.IsEqual(Window.Property(ApplianceTorBoxQr),true)</visible>
+			</control>
 			<control type="grouplist" id="9000">
 				<orientation>horizontal</orientation>
 				<left>0</left>

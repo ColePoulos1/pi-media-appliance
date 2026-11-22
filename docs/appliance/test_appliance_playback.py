@@ -1,7 +1,11 @@
 """Exercise appliance playback against a running Kodi fork with disposable userdata."""
 
 import argparse
+import base64
 import json
+import os
+import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -12,6 +16,9 @@ from pathlib import Path
 from threading import Event, Thread
 from time import monotonic, sleep
 from urllib.parse import parse_qs, urlsplit
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 from test_stop_signal import KodiConnection
 
@@ -31,7 +38,7 @@ class Provider(BaseHTTPRequestHandler):
         for name, value in extra_headers:
             self.send_header(name, value)
         self.end_headers()
-        if self.command == "GET":
+        if self.command != "HEAD":
             try:
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
@@ -76,6 +83,10 @@ class Provider(BaseHTTPRequestHandler):
                     (20, "a", [dict(confirmed, size=1024)]), (30, "b", ambiguous),
                     (12, "c", [dict(confirmed, id=7)]), (11, "C", pack))
             ]
+            if self.server.mode == "capped":
+                for torrent in torrents:
+                    for member in torrent["files"]:
+                        member["size"] = 3_000_000_000
             self.reply(200, json.dumps({"success": True, "data": torrents}).encode(),
                        "application/json")
             self.server.listed_at = monotonic()
@@ -782,6 +793,8 @@ def home_check(userdata, port, phase):
     root = userdata / "appliance"
     folder = Path.home() / "M4 Fixture Movies"
     media = folder / "A Fixture Movie.mkv"
+    duplicate = folder / "A Fixture Movie Copy.mkv"
+    unmatched = folder / "Needs a match.mkv"
     title = media.stem
     if phase == "first":
         assert not root.exists(), root
@@ -792,6 +805,21 @@ def home_check(userdata, port, phase):
         media.with_suffix(".nfo").write_text(
             f'<movie><title>{title}</title><uniqueid type="tmdb" default="true">'
             '900000004</uniqueid></movie>', encoding="utf-8")
+        shutil.copyfile(media, duplicate)
+        shutil.copyfile(media.with_suffix(".nfo"), duplicate.with_suffix(".nfo"))
+        shutil.copyfile(media, unmatched)
+        series = folder / "Fixture Show"
+        series.mkdir()
+        (series / "tvshow.nfo").write_text(
+            '<tvshow><title>Fixture Show</title><uniqueid type="tmdb" default="true">'
+            '900000005</uniqueid></tvshow>', encoding="utf-8")
+        for n, name in enumerate(("First", "Second"), start=1):
+            episode = series / f"Fixture Show.S01E{n:02}.{name}.mkv"
+            shutil.copyfile(media, episode)
+            episode.with_suffix(".nfo").write_text(
+                f'<episodedetails><title>{name}</title><season>1</season><episode>{n}</episode>'
+                f'<uniqueid type="tmdb" default="true">{900000005 + n}</uniqueid></episodedetails>',
+                encoding="utf-8")
 
     with (ThreadingHTTPServer(("127.0.0.1", 0), Provider) as provider,
           socket.create_connection(("127.0.0.1", port), timeout=10) as connection):
@@ -812,15 +840,22 @@ def home_check(userdata, port, phase):
             return kodi.call("VideoLibrary.GetMovies", properties=["file", "uniqueid", "resume"]).get(
                 "movies", [])
 
+        def episodes():
+            return kodi.call("VideoLibrary.GetEpisodes", properties=["file", "uniqueid", "resume"]).get(
+                "episodes", [])
+
         def result_focused():
             return kodi.focused(20) and kodi.label("Container(20).ListItem.Label") == title
 
-        def add_folder():
+        def media_folders():
             kodi.navigate("Down", lambda: kodi.focused(14))
             press(14, 12000)
             assert kodi.label() == "Media folders"
             press()
             kodi.wait_until(lambda: kodi.label() == "Add folder")
+
+        def add_folder():
+            media_folders()
             press(window=10126)
             kodi.navigate("Down", lambda: kodi.label() == "Home folder")
             press()
@@ -830,6 +865,31 @@ def home_check(userdata, port, phase):
             kodi.call("Input.Left")
             press(413)
             kodi.wait_for("VideoLibrary.OnScanFinished", 20)
+            kodi.wait_until(lambda: len(episodes()) == 2)
+
+        def match_file():
+            media_folders()
+            kodi.navigate("Down", lambda: folder.name in kodi.label())
+            press()
+            kodi.navigate("Down", lambda: kodi.label() == "Unmatched files")
+            press()
+            kodi.wait_until(lambda: kodi.label() == unmatched.name)
+            press()
+            kodi.navigate("Down", lambda: kodi.label() == "Match to a library title")
+            press()
+            kodi.navigate("Down", lambda: kodi.label() == title)
+            press(window=10000)
+            kodi.wait_until(lambda: str(unmatched) in row.read_text(encoding="utf-8"))
+
+        def set_stream_cap(label):
+            kodi.navigate("Down", lambda: kodi.focused(14))
+            press(14, 12000)
+            kodi.navigate("Down", lambda: kodi.label() == "Advanced playback settings")
+            press()
+            kodi.wait_until(lambda: kodi.label() == "Maximum stream file size")
+            press()
+            kodi.navigate("Down", lambda: kodi.label() == label)
+            press(window=10000)
 
         try:
             kodi.wait_until(lambda: kodi.window() == 10000)
@@ -849,12 +909,17 @@ def home_check(userdata, port, phase):
             assert movie["file"] == str(anchor) and movie["uniqueid"]["tmdb"] == "900000004", movie
             assert anchor.stat().st_size == 0 and anchor.with_suffix(".nfo").is_file()
             entry = json.loads(row.read_text(encoding="utf-8"))
-            assert entry["local"] == [str(media)], entry
+            expected_paths = {str(media), str(duplicate)}
+            if phase == "restart":
+                expected_paths.add(str(unmatched))
+            assert {copy["path"] for copy in entry["local"]} == expected_paths, entry
+            assert {item["uniqueid"]["tmdb"] for item in episodes()} == {"900000006", "900000007"}
             # Give discovery a valid route so removing the media tests the local-only gate.
             write_json(root / "providers.json", {"fixture": f"http://127.0.0.1:{provider.server_port}"})
             write_json(row, dict(entry, query="Pilot Show"))
 
             if phase == "first":
+                match_file()
                 kodi.navigate("Down", lambda: kodi.focused(11))
                 press(11, 10103)
                 kodi.call("Input.Right")
@@ -873,6 +938,7 @@ def home_check(userdata, port, phase):
                 kodi.seek(player, 15)
                 kodi.stop(player)
                 kodi.wait_until(lambda: abs(movies()[0]["resume"]["position"] - 15) <= 2)
+                assert not provider.calls, provider.calls
             else:
                 assert movie["movieid"] == saved["movieid"] and movie["resume"] == saved["resume"]
                 kodi.navigate("Down", lambda: kodi.focused(13))
@@ -884,8 +950,8 @@ def home_check(userdata, port, phase):
                 assert abs(kodi.position(player) - saved["resume"]["position"]) <= 2
                 kodi.stop(player)
 
-                missing = media.with_suffix(".missing")
-                media.rename(missing)
+                missing = folder.with_name(folder.name + " offline")
+                folder.rename(missing)
                 try:
                     kodi.call("Player.Open", item={"movieid": movie["movieid"]})
                     kodi.wait_until(lambda: kodi.window() == 12000)
@@ -897,11 +963,529 @@ def home_check(userdata, port, phase):
                     kodi.call("Input.Back")
                     kodi.wait_until(lambda: kodi.window() != 12000)
                 finally:
-                    missing.rename(media)
+                    missing.rename(folder)
                 kodi.stop(kodi.play(media))
-            assert not provider.calls, provider.calls
-            print(f"Home {phase}: indexed movie, title detail and bookmark, zero provider requests")
+                kodi.call("Input.Home")
+                kodi.wait_until(lambda: kodi.window() == 10000)
+                if kodi.focused(20):
+                    kodi.call("Input.Left")
+                set_stream_cap("2 GB")
+
+                episode = next(item for item in episodes() if item["uniqueid"]["tmdb"] == "900000007")
+                second_row = root / "index" / "episode-tmdb-900000007.json"
+                second = json.loads(second_row.read_text(encoding="utf-8"))
+                write_json(second_row, dict(second, title="Return", query="Pilot Show"))
+                write_json(root / "providers.json", {
+                    "fixture": f"http://127.0.0.1:{provider.server_port}", "accountMode": "online",
+                })
+                kodi.call("Player.Open", item={"episodeid": episode["episodeid"]})
+                player = kodi.start()
+                kodi.seek(player, 12)
+                kodi.stop(player)
+                assert not provider.calls, provider.calls
+                first = next(item for item in episodes() if item["uniqueid"]["tmdb"] == "900000006")
+                kodi.call("Player.Open", item={"episodeid": first["episodeid"]})
+                player = kodi.start()
+                kodi.seek(player, 7)
+                kodi.stop(player)
+                kodi.wait_until(lambda: all(
+                    abs(item["resume"]["position"] - expected) <= 2
+                    for item, expected in zip(sorted(episodes(), key=lambda item: item["file"]), (7, 12))))
+
+                provider.media = media.read_bytes()
+                provider.mode = "capped"
+                provider.discovery_started = Event()
+                provider.discovery_replied = Event()
+                provider.release_discovery = Event()
+                provider.release_discovery.set()
+                missing_episode = Path(second["local"][0]["path"])
+                moved_episode = missing_episode.with_suffix(".missing")
+                missing_episode.rename(moved_episode)
+                try:
+                    kodi.call("Player.Open", item={"episodeid": episode["episodeid"]})
+                    kodi.wait_until(lambda: kodi.window() == 12000)
+                    assert provider.calls == {"discover": 1, "list": 1}, provider.calls
+                    kodi.call("Input.Back")
+                    kodi.wait_until(lambda: kodi.window() != 12000)
+                finally:
+                    moved_episode.rename(missing_episode)
+
+                media_folders()
+                kodi.navigate("Down", lambda: folder.name in kodi.label())
+                press()
+                kodi.navigate("Down", lambda: kodi.label() == "Remove folder")
+                press(window=10100)
+                kodi.navigate("Right", lambda: kodi.focused(11))
+                press(11, 10000)
+                kodi.wait_until(lambda: not json.loads(row.read_text(encoding="utf-8"))["local"])
+                retained, = movies()
+                assert retained["movieid"] == saved["movieid"]
+                assert abs(retained["resume"]["position"] - saved["resume"]["position"]) <= 2
+                assert len(episodes()) == 2
+                print("Home restart: stream cap excluded remote candidates and folder removal kept titles")
+
+                set_stream_cap("Unlimited")
+                provider.mode = "clean"
+                provider.resolved_routes = []
+                kodi.call("Player.Open", item={"episodeid": episode["episodeid"]})
+                player = kodi.start()
+                kodi.seek(player, 24)
+                kodi.stop(player)
+                kodi.wait_until(lambda: any(
+                    item["episodeid"] == episode["episodeid"] and
+                    abs(item["resume"]["position"] - 24) <= 2 for item in episodes()))
+                assert provider.calls["resolve"] == 1, provider.calls
+                assert kodi.call("Favourites.AddFavourite", type="media", title="Second",
+                                 path=episode["file"]) == "OK"
+                add_folder()
+                for setting in ("myvideos.selectaction", "myvideos.playaction"):
+                    assert kodi.call("Settings.SetSettingValue", setting=setting, value=2)
+                kodi.navigate("Down", lambda: kodi.focused(12))
+                press(12)
+                kodi.wait_until(lambda: kodi.label() == "Second")
+                press()
+                player = kodi.start()
+                assert abs(kodi.position(player) - 24) <= 2
+                kodi.stop(player)
+                assert provider.calls["resolve"] == 1, provider.calls
+                print("Home restart: added a local copy after remote playback and resumed from Favorites")
+            print(f"Home {phase}: indexed movie and episodes, detail, bookmark and local-first play")
         finally:
+            provider.shutdown()
+
+
+def smb_folder_check(userdata, port):
+    source = "smb://127.0.0.1:1445/appliance/"
+    with (tempfile.TemporaryDirectory(prefix="appliance-smb-") as directory,
+          socket.create_connection(("127.0.0.1", port), timeout=10) as connection):
+        root = Path(directory)
+        root.chmod(0o755)
+        share = root / "share"
+        share.mkdir(mode=0o755)
+        media = share / "SMB Fixture.mkv"
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                        "-i", "color=red:size=160x90:rate=10", "-t", "40", "-c:v", "mpeg4",
+                        str(media)], check=True)
+        media.with_suffix(".nfo").write_text(
+            '<movie><title>SMB Fixture</title><uniqueid type="tmdb" default="true">'
+            '900000020</uniqueid></movie>', encoding="utf-8")
+        config = root / "smb.conf"
+        config.write_text(f"""[global]
+    interfaces = lo
+    bind interfaces only = yes
+    smb ports = 1445
+    map to guest = Bad User
+    pid directory = {root}
+    lock directory = {root}
+    state directory = {root}
+    cache directory = {root}
+    private dir = {root}
+    log file = {root}/samba.log
+[appliance]
+    path = {share}
+    guest ok = yes
+    guest only = yes
+    read only = yes
+""", encoding="utf-8")
+        kodi = Kodi(connection)
+        server = None
+
+        def ready():
+            try:
+                with socket.create_connection(("127.0.0.1", 1445), timeout=0.3):
+                    return True
+            except OSError:
+                return False
+
+        def start_share():
+            nonlocal server
+            assert not ready(), "SMB fixture port is already in use"
+            server = subprocess.Popen(
+                ["smbd", "--foreground", "--no-process-group", "--configfile", str(config)],
+                start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                kodi.wait_until(ready)
+            except AssertionError as error:
+                log = root / "samba.log"
+                raise AssertionError(log.read_text() if log.exists() else server.poll()) from error
+
+        def stop_share():
+            nonlocal server
+            if server and server.poll() is None:
+                os.killpg(server.pid, signal.SIGTERM)
+                server.wait(timeout=5)
+            server = None
+
+        def select(window=None):
+            kodi.request("Input.Select")
+            if window:
+                kodi.wait_until(lambda: kodi.window() == window)
+
+        def folders():
+            kodi.navigate("Down", lambda: kodi.focused(14))
+            select(12000)
+            select()
+            kodi.wait_until(lambda: kodi.label() == "Add folder")
+
+        def library_movie():
+            movies, = kodi.call("VideoLibrary.GetMovies", properties=["resume"])["movies"]
+            return movies
+
+        try:
+            start_share()
+            kodi.wait_until(lambda: kodi.focused(10))
+            select(10000)
+            folders()
+            select(10126)
+            kodi.navigate("Down", lambda: kodi.label() == source)
+            select()
+            kodi.wait_until(lambda: source in kodi.label("Control.GetLabel(412)"))
+            kodi.call("Input.Left")
+            kodi.wait_until(lambda: kodi.focused(413))
+            select()
+            kodi.wait_for("VideoLibrary.OnScanFinished", 20)
+            row_path = userdata / "appliance/index/movie-tmdb-900000020.json"
+            previous = row_path.read_bytes()
+            row = json.loads(previous)
+            assert row["local"][0]["path"] == source + media.name, row
+            item = {"movieid": library_movie()["movieid"]}
+            kodi.call("Player.Open", item=item)
+            player = kodi.start()
+            kodi.seek(player, 10)
+            kodi.stop(kodi.play(media))
+            kodi.wait_until(lambda: abs(library_movie()["resume"]["position"] - 10) <= 2)
+            saved = library_movie()
+
+            stop_share()
+            kodi.call("Input.Home")
+            folders()
+            kodi.navigate("Down", lambda: kodi.label() == source)
+            select()
+            kodi.wait_until(lambda: kodi.label() == "Rescan folder")
+            select(10000)
+            kodi.wait_until(lambda: "No titles were added" in
+                            kodi.label("Window.Property(ApplianceImport)"), timeout=20)
+            assert row_path.read_bytes() == previous and library_movie() == saved
+            start_share()
+            kodi.call("Player.Open", item=item, options={"resume": True})
+            player = kodi.start()
+            assert abs(kodi.position(player) - 10) <= 2
+            kodi.stop(player)
+            print("SMB folder: read-only import, offline rescan retained the title and resume after recovery")
+        finally:
+            stop_share()
+
+
+def account_check(userdata, port, phase):
+    class AccountProvider(Provider):
+        def answer(self, status, **response):
+            self.reply(status, json.dumps(response).encode(), "application/json")
+
+        def do_GET(self):
+            path = urlsplit(self.path).path
+            if path == "/v1/api/user/auth/device/start":
+                self.server.calls["start"] += 1
+                self.answer(200, success=True, data={
+                    "device_code": "fixture-private-code", "code": "ABC-DEF",
+                    "verification_url": "https://torbox.app/device",
+                    "friendly_verification_url": "https://tor.box/link",
+                    "interval": 1, "expires_in": 20,
+                })
+            elif path == "/v1/api/user/me":
+                token = self.headers["Authorization"]
+                self.server.calls["me"] += 1
+                accepted = token in {"Bearer fixture-token", "Bearer replacement-token"}
+                self.answer(200 if accepted else 403, success=accepted)
+            else:
+                super().do_GET()
+
+        def do_POST(self):
+            assert self.path == "/v1/api/user/auth/device/token", self.path
+            assert self.headers["Content-Type"] == "application/json"
+            assert json.loads(self.rfile.read(int(self.headers["Content-Length"]))) == {
+                "device_code": "fixture-private-code",
+            }
+            self.server.calls["poll"] += 1
+            self.server.polled.set()
+            assert self.server.release.wait(5)
+            status, response = self.server.replies.pop(0)
+            self.answer(status, **response)
+
+    path = userdata / "appliance" / "providers.json"
+    with (ThreadingHTTPServer(("127.0.0.1", 0), AccountProvider) as provider,
+          socket.create_connection(("127.0.0.1", port), timeout=10) as connection):
+        provider.calls = Counter()
+        provider.polled = Event()
+        provider.release = Event()
+        provider.release.set()
+        Thread(target=provider.serve_forever, daemon=True).start()
+        kodi = Kodi(connection)
+        initial = {"fixture": f"http://127.0.0.1:{provider.server_port}",
+                   "prowlarr": "http://example.invalid", "prowlarrKey": "synthetic"}
+
+        def read_account():
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        def select(window):
+            kodi.request("Input.Select")
+            kodi.wait_until(lambda: kodi.window() == window)
+
+        def open_account(setup=False):
+            if setup:
+                kodi.navigate("Down", lambda: kodi.focused(16))
+                select(12000)
+            else:
+                kodi.navigate("Down", lambda: kodi.focused(14))
+                select(12000)
+                kodi.navigate("Down", lambda: kodi.label() == "TorBox account")
+                kodi.request("Input.Select")
+                kodi.wait_until(lambda: kodi.label() == "Link TorBox on your phone")
+
+        try:
+            kodi.wait_until(lambda: kodi.window() == 10000)
+            if phase == "local-restart":
+                kodi.wait_until(lambda: kodi.focused(11))
+                assert read_account()["accountMode"] == "local"
+                assert "torboxKey" not in read_account()
+                return
+            if phase == "online-restart":
+                kodi.wait_until(lambda: kodi.focused(11))
+                online = read_account()
+                write_json(path, dict(online, fixture=initial["fixture"]))
+                open_account()
+                kodi.navigate("Down", lambda: kodi.label().startswith("Unlink TorBox"))
+                select(10000)
+                kodi.wait_until(lambda: read_account() == dict(initial, accountMode="local"))
+                return
+
+            path.parent.mkdir()
+            write_json(path, initial)
+            pending = (400, {"success": False, "error": "DEVICE_CODE_NOT_USED"})
+            expired = (404, {"success": False, "error": "ITEM_NOT_FOUND"})
+            success = (200, {"success": True, "data": {"token": "fixture-token"}})
+
+            open_account(setup=True)
+            provider.replies = [pending, expired]
+            select(10101)
+            kodi.wait_until(lambda: kodi.window() == 12002)
+            kodi.call("Input.Back")
+            kodi.wait_until(lambda: kodi.window() == 10000)
+            assert read_account() == initial
+            assert provider.calls["poll"] == 2
+
+            open_account(setup=True)
+            provider.replies = [success]
+            provider.release.clear()
+            provider.polled.clear()
+            select(10101)
+            assert provider.polled.wait(5)
+            kodi.call("Input.Back")
+            kodi.wait_until(lambda: kodi.window() == 10000)
+            provider.release.set()
+            kodi.wait_until(lambda: not provider.replies)
+            assert read_account() == initial and provider.calls["me"] == 0
+
+            open_account(setup=True)
+            provider.replies = [pending, success]
+            select(10101)
+            kodi.wait_until(lambda: kodi.focused(11))
+            assert read_account() == dict(initial, torboxKey="fixture-token", accountMode="online")
+            assert path.stat().st_mode & 0o777 == 0o600
+
+            for token in ("invalid-token", "replacement-token"):
+                open_account()
+                kodi.navigate("Down", lambda: kodi.label() == "Enter TorBox API key")
+                select(10103)
+                kodi.request("Input.SendText", text=token, done=True)
+                if token == "invalid-token":
+                    kodi.wait_until(lambda: kodi.window() == 12002)
+                    kodi.call("Input.Back")
+                    kodi.wait_until(lambda: kodi.window() == 10000)
+                    assert read_account()["torboxKey"] == "fixture-token"
+                else:
+                    kodi.wait_until(lambda: read_account()["torboxKey"] == token)
+            print("Account: pending/expiry, canceled late reply, device link and manual relink")
+        finally:
+            provider.release.set()
+            provider.shutdown()
+
+
+def remote_settings_check(userdata, port):
+    web_port = 19125
+
+    def ping(password=None):
+        request = Request(
+            f"http://127.0.0.1:{web_port}/jsonrpc",
+            data=b'{"jsonrpc":"2.0","method":"JSONRPC.Ping","id":1}',
+            headers={"Content-Type": "application/json"})
+        if password:
+            authorization = base64.b64encode(f"kodi:{password}".encode()).decode()
+            request.add_header("Authorization", f"Basic {authorization}")
+        try:
+            with urlopen(request, timeout=2) as response:
+                return json.load(response).get("result")
+        except HTTPError as error:
+            return error.code
+        except URLError:
+            return "closed"
+
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+        kodi = Kodi(connection)
+
+        def select(window):
+            kodi.request("Input.Select")
+            kodi.wait_until(lambda: kodi.window() == window)
+
+        def open_remote():
+            kodi.navigate("Down", lambda: kodi.focused(14))
+            select(12000)
+            kodi.navigate("Down", lambda: kodi.label() == "Official Kodi Remote for iOS")
+            kodi.request("Input.Select")
+
+        def password():
+            settings = ElementTree.parse(userdata / "guisettings.xml")
+            return settings.findtext(".//setting[@id='services.webserverpassword']")
+
+        kodi.wait_until(lambda: kodi.focused(10))
+        select(10000)
+        assert kodi.call("Settings.SetSettingValue", setting="services.webserverport", value=web_port)
+        assert ping() == "closed"
+        open_remote()
+        kodi.wait_until(lambda: kodi.label() == "Enable iOS remote")
+        select(10100)
+        kodi.navigate("Right", lambda: kodi.focused(11))
+        select(12002)
+        original = password()
+        assert original and len(original) == 20
+        assert ping() == 401 and ping("wrong-fixture-password") == 401
+        assert ping(original) == "pong"
+        kodi.call("Input.Back")
+        kodi.wait_until(lambda: kodi.window() == 10000)
+
+        open_remote()
+        kodi.navigate("Down", lambda: kodi.label() == "Replace remote password")
+        select(12002)
+        replacement = password()
+        assert replacement and replacement != original
+        assert ping(original) == 401 and ping(replacement) == "pong"
+        kodi.call("Input.Back")
+        kodi.wait_until(lambda: kodi.window() == 10000)
+
+        open_remote()
+        kodi.navigate("Down", lambda: kodi.label() == "Disable iOS remote")
+        select(10000)
+        kodi.wait_until(lambda: ping(replacement) == "closed")
+        print("iOS settings: HTTP control closed by default, authenticated after enable and revocable")
+
+
+def catalog_check(userdata, port):
+    movie = {"id": 900000010, "media_type": "movie", "title": "Catalog Movie",
+             "release_date": "2026-01-01", "runtime": 120, "original_language": "en"}
+    show = {"id": 900000011, "media_type": "tv", "name": "Catalog Show",
+            "seasons": [{"id": 900000012, "name": "Season 1", "season_number": 1}],
+            "original_language": "ja", "genres": [{"id": 16}]}
+    episodes = [{"id": 900000013 + i, "name": name, "season_number": 1, "episode_number": i,
+                 "runtime": 24} for i, name in enumerate(("Arrival", "Return"), start=1)]
+
+    class CatalogProvider(Provider):
+        def do_GET(self):
+            url = urlsplit(self.path)
+            if url.path == "/3/search/multi":
+                query, = parse_qs(url.query)["query"]
+                if query == "stale":
+                    self.server.started.set()
+                    assert self.server.release.wait(5)
+                    response = {"results": [dict(movie, title="Stale Catalog Movie")]}
+                else:
+                    assert query == "catalog", query
+                    response = {"results": [movie, movie, show, {"media_type": "person"}]}
+            else:
+                response = {"/3/movie/900000010": movie, "/3/tv/900000011": show,
+                            "/3/tv/900000011/season/1": {"episodes": episodes}}[url.path]
+            self.reply(200, json.dumps(response).encode(), "application/json")
+
+    with (ThreadingHTTPServer(("127.0.0.1", 0), CatalogProvider) as provider,
+          socket.create_connection(("127.0.0.1", port), timeout=10) as connection):
+        provider.release = Event()
+        provider.started = Event()
+        Thread(target=provider.serve_forever, daemon=True).start()
+        root = userdata / "appliance"
+        write_json(root / "providers.json", {
+            "accountMode": "online", "catalogFixture": f"http://127.0.0.1:{provider.server_port}",
+        })
+        kodi = Kodi(connection)
+
+        def select(window):
+            kodi.request("Input.Select")
+            kodi.wait_until(lambda: kodi.window() == window)
+
+        def search(query):
+            kodi.wait_until(lambda: kodi.focused(11))
+            select(10103)
+            kodi.request("Input.SendText", text=query, done=True)
+            kodi.wait_until(lambda: kodi.window() == 10000)
+
+        def focus_title(label):
+            kodi.navigate("Down", lambda: kodi.label("Container(20).ListItem.Label") == label)
+
+        def records(kind):
+            return kodi.call(f"VideoLibrary.Get{kind}", properties=["file", "uniqueid"]).get(
+                kind.lower(), [])
+
+        try:
+            search("stale")
+            assert provider.started.wait(5)
+            kodi.call("Input.Back")
+            kodi.wait_until(lambda: not kodi.label("Window.Property(ApplianceSection)"))
+            provider.release.set()
+            search("catalog")
+            kodi.wait_until(lambda: kodi.focused(20))
+            assert kodi.label("Container(20).NumItems") == "2"
+            focus_title("Catalog Movie")
+            select(12003)
+            saved, = records("Movies")
+            assert saved["uniqueid"]["tmdb"] == "900000010", saved
+            kodi.call("Input.Back")
+            kodi.wait_until(lambda: kodi.window() == 10000)
+
+            focus_title("Catalog Show")
+            kodi.request("Input.Select")
+            kodi.wait_until(lambda: kodi.label("Container(20).ListItem.Label") == "Season 1")
+            kodi.request("Input.Select")
+            kodi.wait_until(lambda: kodi.label("Container(20).ListItem.Label") == "Arrival")
+            for episode in episodes:
+                focus_title(episode["name"])
+                select(12003)
+                kodi.call("Input.Back")
+                kodi.wait_until(lambda: kodi.window() == 10000)
+
+            assert len(records("TVShows")) == 1
+            indexed = records("Episodes")
+            assert {item["uniqueid"]["tmdb"] for item in indexed} == {
+                str(episode["id"]) for episode in episodes
+            }, indexed
+            for episode in episodes:
+                row = json.loads((root / "index" / f"episode-tmdb-{episode['id']}.json").read_text())
+                assert row["seriesId"] == "tmdb:900000011" and row["runtimeSeconds"] == 1440
+                assert row["anime"] is True and row["originalLanguage"] == "ja"
+            make_language_media(root / "language-fixture")
+            for setting in ("locale.audiolanguage", "locale.subtitlelanguage"):
+                assert kodi.call("Settings.SetSettingValue", setting=setting, value="English")
+            for index, episode in enumerate(sorted(indexed, key=lambda item: item["file"])):
+                local_row = root / "index" / f"episode-tmdb-{episode['uniqueid']['tmdb']}.json"
+                entry = json.loads(local_row.read_text(encoding="utf-8"))
+                write_json(local_row, dict(entry, local=[str(root / "language-fixture" / "dual.mkv")]))
+                kodi.call("Player.Open", item={"episodeid": episode["episodeid"]})
+                if index == 0:
+                    kodi.wait_until(lambda: kodi.window() == 12000)
+                    assert kodi.label().startswith("Sub")
+                    kodi.request("Input.Select")
+                player = kodi.start()
+                kodi.tracks(player, "jpn", 240, "eng")
+                kodi.stop(player)
+            print("Catalog: stale search, deduplicated movie, show seasons and shared episode language")
+        finally:
+            provider.release.set()
             provider.shutdown()
 
 
@@ -1133,6 +1717,10 @@ if __name__ == "__main__":
     parser.add_argument("--recovery-phase", choices=["first", "restart"])
     parser.add_argument("--library-phase", choices=["first", "restart"])
     parser.add_argument("--home-phase", choices=["first", "restart"])
+    parser.add_argument("--account-phase", choices=["first", "online-restart", "local-restart"])
+    parser.add_argument("--catalog", action="store_true")
+    parser.add_argument("--smb-folder", action="store_true")
+    parser.add_argument("--remote-settings", action="store_true")
     parser.add_argument("--measure-frames", action="store_true",
                         help="sample first visible frames on a 1280x720x24 Linux Xvfb display")
     args = parser.parse_args()
@@ -1145,5 +1733,13 @@ if __name__ == "__main__":
         library_check(userdata, args.port, args.library_phase)
     elif args.home_phase:
         home_check(userdata, args.port, args.home_phase)
+    elif args.account_phase:
+        account_check(userdata, args.port, args.account_phase)
+    elif args.catalog:
+        catalog_check(userdata, args.port)
+    elif args.smb_folder:
+        smb_folder_check(userdata, args.port)
+    elif args.remote_settings:
+        remote_settings_check(userdata, args.port)
     else:
         run(userdata, args.port, args.measure_frames)

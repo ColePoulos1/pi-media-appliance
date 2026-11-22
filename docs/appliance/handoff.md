@@ -33,7 +33,42 @@ The legacy index and seeded library scenarios passed. The baseline exercised loc
 
 The [provider evaluation](m4-provider-evaluation.md) records the four candidates, public endpoint checks and operator and credential constraints. BitSearch is the first candidate for matched coverage testing because its direct API offers keyless access. The next open question is how many of the owner's Fen-playable movies and episodes an eligible candidate can play and whether its operator permits the shipped use. Compare both setups on the agreed private sample using the same TorBox account, with the owner's server unavailable to the appliance and Prowlarr unconfigured on it.
 
-The fork stays public. The owner supplied a TMDB API key from a dedicated disposable account with no other services linked. The workstation stores it as `TMDB_API_KEY` in the Git-ignored root `.env`. Confirmation that the registration covers the intended distribution, confirmation of the bundled read-token model, and fresh-image catalog lookup are pending. The evaluation records the applicable attribution and cache terms. M4 points 3 through 7 remain open.
+The fork stays public. The owner supplied a TMDB API key from a dedicated disposable account with no other services linked. The workstation stores it as `TMDB_API_KEY` in the Git-ignored root `.env`. Confirmation that the registration covers the intended distribution, confirmation of the bundled read-token model, and fresh-image catalog lookup are pending. The evaluation records the applicable attribution and cache terms.
+
+### M4 point 4 desktop acceptance
+
+**21 November 2026.** Desktop acceptance passed through point 4. The tested code, fixture and overlay tree is `fc202b6a62ec8568440841f59c00145892561eee`, based on appliance revision `2c30759347f8787494aadda3f49b8234d651747b`. Home offers local-only setup, TorBox device authorization with a verification link and QR, and masked manual key entry. Validation uses `/v1/api/user/me`. Linking and unlinking preserve optional Prowlarr settings. The saved provider file is replaced atomically with mode `0600` on Linux. Local-only applies to catalog requests and to release discovery, resolution and retries after local exhaustion. [TorBox API schema](https://api.torbox.app/openapi.json)
+
+The [LibreELEC settings patch](libreelec-settings-network.patch) hands first run to Home and adds a network-only entry through the existing ConnMan UI. On the pinned LibreELEC checkout, place it at `packages/mediacenter/LibreELEC-settings/patches/LibreELEC-settings-01-appliance-network.patch` before unpacking and building the settings add-on. The full settings entry and the background service remain available to LibreELEC. The patch passed `patch -p1 --dry-run` against the pinned settings source `6ff1cf26381d7a29c95886cdd0b7b222978ebb1d`. The four modified Python sources compiled. A separate QR decoder read `https://tor.box/link` from the shipped PNG. That public link redirected to TorBox's device authorization page.
+
+Catalog search shows matching library entries first and adds TMDB results asynchronously. Back, another query and a profile change invalidate the outstanding result. A selected movie or episode uses the existing appliance anchor and Kodi library identity. TV results open seasons and episodes. Episode rows carry episode ID, series ID, original language and runtime in seconds. The workstation development key returned HTTP 200 from TMDB's configuration endpoint. Start desktop Kodi with the Git-ignored key in its process environment to make live catalog requests. The distribution path reads an application token from `special://xbmc/system/appliance-tmdb-token` if supplied during private packaging. Distribution approval, attribution and the TMDB cache lifecycle still need verification. [TMDB application authentication](https://developer.themoviedb.org/docs/authentication-application)
+
+Media folders now take local, USB and SMB paths from Kodi's browser. The index groups copies by qualified movie or episode ID. For episodes, provide a sidecar `episodedetails` NFO and a parent `tvshow.nfo` with the series TMDB ID. A filename-only match requires a single existing title match. The folder menu can rescan, play or match an unmatched file, or remove the source's copies while retaining title records and bookmarks. Playback settings on Home include Kodi audio and subtitle languages, separate Movie, TV and Anime choices, the M3 profiles, optional Prowlarr, remote size and bitrate caps, and a device resolution override. The attempt reads reported HDR formats at Play time and preserves unknowns when the window system supplies no HDR capability information. Home also offers optional iOS setup on a connected LibreELEC installation and in Settings. This uses Kodi's authenticated HTTP service, generates a per-installation password and keeps the raw LAN control setting off when enabling it.
+
+#### Desktop verification
+
+Build and launch on the [documented X11 environment](#m4-point-1-desktop-evidence), with disposable userdata for every first phase. Reuse userdata only for the listed restart phases. The Samba run additionally requires `smbd` and Kodi built with SMB support. Before Kodi starts, put the fixture location in that profile's `mediasources.xml` as `<mediasources><network><location id="0">smb://127.0.0.1:1445/appliance/</location></network></mediasources>`. The driver runs its own loopback read-only share.
+
+```sh
+cmake --build /appliance-build --target kodi-test kodi-x11 -j 7
+(cd /appliance-build && ./kodi-test --gtest_filter='TestAppliancePlayback.*:TestFile.Read')
+python3 -B -u docs/appliance/test_appliance_playback.py "$home_userdata" --port 19117 --home-phase first
+python3 -B -u docs/appliance/test_appliance_playback.py "$home_userdata" --port 19117 --home-phase restart
+python3 -B -u docs/appliance/test_appliance_playback.py "$account_userdata" --port 19119 --account-phase first
+python3 -B -u docs/appliance/test_appliance_playback.py "$account_userdata" --port 19119 --account-phase online-restart
+python3 -B -u docs/appliance/test_appliance_playback.py "$account_userdata" --port 19119 --account-phase local-restart
+python3 -B -u docs/appliance/test_appliance_playback.py "$catalog_userdata" --port 19121 --catalog
+python3 -B -u docs/appliance/test_appliance_playback.py "$smb_userdata" --port 19123 --smb-folder
+python3 -B -u docs/appliance/test_appliance_playback.py "$remote_userdata" --port 19124 --remote-settings
+```
+
+Before the catalog run, create `appliance/providers.json` in the disposable profile with `{"accountMode":"online"}` and use the same null ALSA sink as the seeded library run. The driver inserts its own loopback catalog endpoint. The iOS settings fixture uses loopback HTTP port 19125.
+
+All 15 focused GTests passed. The account fixture covered pending and expired authorization, a canceled late reply, invalid and valid manual replacement, unlink, and restart in both account modes. The catalog fixture discarded a reply after Back, deduplicated movie results, browsed a show and season, and reused the first episode's Sub choice for a second episode. The Home fixture imported two copies of a movie and two episodes, corrected an unmatched file, retained distinct bookmarks, applied a 2 GB cap only to the remote tier, and resumed a prior remote episode from Favorites after re-adding its local copy with zero new resolutions. The read-only Samba fixture imported from a loopback share, preserved the index and bookmark when the share went offline, and resumed after it returned. The iOS settings fixture observed a closed HTTP port by default, HTTP 401 without valid credentials, successful authenticated control, and revocation on rotation and disable.
+
+The prior baseline playback and seeded movie and episode library assertions also passed. Two desktop runs reported a process abort after their assertions when the harness terminated Kodi with SIGTERM, including one allocator error. The SMB fixture repeated with `Application.Quit` and exited cleanly. Pi shutdown behavior and the cause of the desktop termination issue remain unverified.
+
+The next physical run still needs the LibreELEC wizard handoff, Ethernet, Wi-Fi, physical CEC input, live TorBox phone authorization, and real HDMI capability observations. Official Kodi Remote discovery, text entry and authenticated control from a separate LAN client remain point 6 acceptance. The HTTP pairing setup uses Kodi's existing transport settings. Default-provider selection and the household comparison remain open. Point 5 release discovery and cache acquisition were outside this checkpoint.
 
 ## Milestone 3 baseline
 

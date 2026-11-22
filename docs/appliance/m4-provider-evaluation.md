@@ -35,7 +35,7 @@ Ran unsigned GETs from Windows with `curl.exe -LsS --max-time 12 -o NUL -w '%{ht
 
 ## TMDB application registration
 
-**Local development key available.** The owner supplied an API key from a dedicated disposable TMDB account with no other services linked. The public source fork uses a Git-ignored workstation `.env` with the entry `TMDB_API_KEY=<your-key>`. The existing build does not load this file. The key's API access has yet to be verified.
+**Local development key verified.** The owner supplied an API key from a dedicated disposable TMDB account with no other services linked. The public source fork uses a Git-ignored workstation `.env` with the entry `TMDB_API_KEY=<your-key>`. Kodi reads this key from its process environment for development. Export it before launching Kodi. A workstation request to `/3/configuration` returned HTTP 200 on 21 November 2026.
 
 Confirm through the API section of the owner's TMDB account that the registration covers the Kodi-based appliance, private non-commercial distribution to trusted friends, and HTTPS catalog calls directly from each Pi using one bundled, extractable application read token. The official application-auth guide uses the API Read Access Token in an `Authorization: Bearer` header for v3 and v4. That flow authenticates catalog reads without asking each viewer to sign in to TMDB. [TMDB FAQ](https://developer.themoviedb.org/docs/faq) · [Application authentication](https://developer.themoviedb.org/docs/authentication-application) · [API settings](https://www.themoviedb.org/settings/api)
 

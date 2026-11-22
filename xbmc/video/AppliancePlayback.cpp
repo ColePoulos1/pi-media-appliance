@@ -16,20 +16,25 @@
 #include "application/ApplicationPlayer.h"
 #include "cores/IPlayer.h"
 #include "cores/VideoPlayer/Interface/StreamInfo.h"
+#include "dialogs/GUIDialogOK.h"
+#include "dialogs/GUIDialogProgress.h"
 #include "dialogs/GUIDialogSelect.h"
 #include "filesystem/Directory.h"
 #include "filesystem/DllLibCurl.h"
 #include "filesystem/File.h"
 #include "filesystem/SpecialProtocol.h"
 #include "guilib/GUIComponent.h"
+#include "guilib/GUIKeyboardFactory.h"
 #include "guilib/GUIWindowManager.h"
 #include "guilib/LocalizeStrings.h"
+#include "platform/Environment.h"
 #include "profiles/ProfileManager.h"
 #include "settings/Settings.h"
 #include "settings/SettingsComponent.h"
 #include "utils/Digest.h"
 #include "utils/JSONVariantParser.h"
 #include "utils/JSONVariantWriter.h"
+#include "utils/JobManager.h"
 #include "utils/LangCodeExpander.h"
 #include "utils/StringUtils.h"
 #include "utils/URIUtils.h"
@@ -37,19 +42,26 @@
 #include "utils/log.h"
 #include "video/VideoDatabase.h"
 #include "video/VideoInfoTag.h"
+#include "windowing/WinSystem.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <filesystem>
+#include <future>
 #include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <regex>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <utility>
+
+#ifndef TARGET_WINDOWS
+#include <unistd.h>
+#endif
 
 namespace KODI::APPLIANCE
 {
@@ -59,10 +71,12 @@ constexpr char ROOT[] = "special://profile/appliance/";
 constexpr char TORBOX[] = "https://api.torbox.app";
 constexpr char TORBOX_TORRENTS[] = "/v1/api/torrents/";
 constexpr char TORBOX_PROVIDER[] = "torbox";
+constexpr char TORBOX_VERIFICATION[] = "https://tor.box/link";
 constexpr char VIDEO_EXTENSIONS[] = ".mkv|.mp4|.m4v|.avi|.webm|.mov|.ts|.m2ts";
 constexpr size_t MAX_RESPONSE = 2 * 1024 * 1024;
 constexpr unsigned int RELEASE_LIMIT = 50;
 constexpr unsigned int TORRENT_LIMIT = 200;
+std::mutex titleIndexMutex;
 
 std::string NormalizeLanguage(const std::string& value)
 {
@@ -108,14 +122,30 @@ LanguageChoice ReadChoice(const PlaybackLanguage& language)
   return LanguageChoice::Ordinary;
 }
 
-bool WriteState(const std::string& path, const std::string& value)
+bool WriteState(const std::string& path, const std::string& value, bool privateFile = false)
 {
   XFILE::CDirectory::Create(URIUtils::GetDirectory(path));
   const auto target = std::filesystem::u8path(CSpecialProtocol::TranslatePath(path));
-  const std::string pending = path + ".tmp";
+  std::string pending = path + ".tmp";
+#ifndef TARGET_WINDOWS
+  if (privateFile)
+  {
+    pending = CSpecialProtocol::TranslatePath(path) + ".XXXXXX";
+    const int descriptor = mkstemp(pending.data());
+    if (descriptor == -1)
+      return false;
+    close(descriptor);
+  }
+#else
+  (void)privateFile;
+#endif
   XFILE::CFile file;
   if (!file.OpenForWrite(pending, true))
+  {
+    if (privateFile)
+      XFILE::CFile::Delete(pending);
     return false;
+  }
   const bool written = file.Write(value.data(), value.size()) == static_cast<ssize_t>(value.size());
   file.Flush();
   file.Close();
@@ -202,7 +232,9 @@ bool IsHttp(const CURL& url)
 
 CVariant GetJson(const std::string& url,
                  const std::atomic_bool& cancelled,
-                 const std::string& header = {})
+                 const std::string& header = {},
+                 const std::string& post = {},
+                 long* status = nullptr)
 {
   if (cancelled || !IsHttp(CURL(url)) || header.find_first_of("\r\n") != std::string::npos)
     return {};
@@ -231,7 +263,9 @@ CVariant GetJson(const std::string& url,
   g_curlInterface.easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
   g_curlInterface.easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
   g_curlInterface.easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-  g_curlInterface.easy_setopt(curl.get(), CURLOPT_FAILONERROR, 1L);
+  g_curlInterface.easy_setopt(curl.get(), CURLOPT_FAILONERROR, status ? 0L : 1L);
+  if (!post.empty())
+    g_curlInterface.easy_setopt(curl.get(), CURLOPT_POSTFIELDS, post.c_str());
   g_curlInterface.easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 2500L);
   g_curlInterface.easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 5000L);
   const auto progress = +[](void* state, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int
@@ -243,8 +277,11 @@ CVariant GetJson(const std::string& url,
   g_curlInterface.easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, receive);
 
   CVariant json;
-  if (g_curlInterface.easy_perform(curl.get()) != CURLE_OK ||
-      !CJSONVariantParser::Parse(response, json))
+  if (g_curlInterface.easy_perform(curl.get()) != CURLE_OK || cancelled)
+    return {};
+  if (status)
+    g_curlInterface.easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, status);
+  if (!CJSONVariantParser::Parse(response, json))
     return {};
   return json;
 }
@@ -823,6 +860,78 @@ std::string LocalPath(const CVariant& item)
 {
   return item.isObject() ? item["path"].asString() : item.asString();
 }
+
+std::map<std::string, std::string> FindAnchors(const std::string& library)
+{
+  std::map<std::string, std::string> paths;
+  CFileItemList anchors;
+  if (XFILE::CDirectory::Exists(library))
+    CUtil::GetRecursiveListing(library, anchors, ".mkv");
+  for (const auto& anchor : anchors)
+  {
+    const auto title = GetTitle(*anchor, library);
+    if (!title.key.empty())
+      paths.emplace(title.key, title.path);
+  }
+  return paths;
+}
+
+bool ValidTmdbId(const std::string& id)
+{
+  return !id.empty() && id.size() <= 20 && id.front() != '0' &&
+         id.find_first_not_of("0123456789") == std::string::npos;
+}
+
+bool LoadNfo(const std::string& text, CVideoInfoTag& tag, const char* type)
+{
+  CXBMCTinyXML document;
+  return !text.empty() && document.Parse(text) && document.RootElement() &&
+         StringUtils::EqualsNoCase(document.RootElement()->ValueStr(), type) &&
+         tag.Load(document.RootElement()) && !tag.m_strTitle.empty() && tag.m_strTitle.size() <= 255 &&
+         ValidTmdbId(tag.GetUniqueID("tmdb"));
+}
+
+bool SaveDocument(const std::string& path, const CVariant& document)
+{
+  std::string json;
+  return CJSONVariantWriter::Write(document, json, true) && json.size() <= MAX_RESPONSE &&
+         WriteState(path, json);
+}
+
+bool AddLocalCopy(const std::string& root,
+                  const Title& title,
+                  const std::string& folder,
+                  const std::string& path,
+                  CVariant entry)
+{
+  auto& local = entry["local"];
+  if (!local.isArray())
+    local = CVariant(CVariant::VariantTypeArray);
+  auto existing = std::find_if(local.begin_array(), local.end_array(),
+                               [&](const CVariant& item) { return LocalPath(item) == path; });
+  if (existing == local.end_array())
+  {
+    CVariant copy;
+    copy["path"] = path;
+    copy["format"] = URIUtils::GetFileName(path);
+    local.push_back(copy);
+    existing = std::prev(local.end_array());
+  }
+  else if (!existing->isObject())
+  {
+    CVariant copy;
+    copy["path"] = path;
+    *existing = std::move(copy);
+  }
+  auto& folders = (*existing)["folders"];
+  if (!folders.isArray())
+    folders = CVariant(CVariant::VariantTypeArray);
+  if (std::none_of(folders.begin_array(), folders.end_array(),
+                   [&](const CVariant& source) { return source.asString() == folder; }))
+    folders.push_back(folder);
+  entry["episode"] = title.episode;
+  return SaveDocument(IndexPath(root, title), entry);
+}
 } // namespace
 
 Title GetTitle(const CFileItem& item)
@@ -835,76 +944,221 @@ CVariant LoadIndexEntry(const Title& title)
   return LoadIndexEntry(title, ROOT);
 }
 
-std::set<std::string> ImportMovieFolder(const std::string& folder, const std::string& root)
+CVariant MediaFolders()
+{
+  return ReadJson(std::string(ROOT) + "folders.json");
+}
+
+bool RemoveMediaFolder(const std::string& folder)
+{
+  std::unique_lock lock(titleIndexMutex);
+  const std::string root = ROOT;
+  const std::string library = root + "library/";
+  auto folders = MediaFolders();
+  if (!folders.isMember(folder))
+    return false;
+
+  for (const auto& anchor : FindAnchors(library))
+  {
+    const auto title = GetTitle(CFileItem(anchor.second, false), library);
+    CVariant entry = ReadJson(IndexPath(root, title));
+    const auto& copies = std::as_const(entry)["local"];
+    if (!copies.isArray())
+      continue;
+    bool changed = false;
+    CVariant retained(CVariant::VariantTypeArray);
+    for (auto it = copies.begin_array(); it != copies.end_array(); ++it)
+    {
+      CVariant copy = *it;
+      if (copy.isObject() && copy.isMember("folders"))
+      {
+        auto& owners = copy["folders"];
+        for (unsigned int i = 0; i < owners.size(); ++i)
+        {
+          if (owners[i].asString() == folder)
+          {
+            owners.erase(i);
+            changed = true;
+            break;
+          }
+        }
+        if (owners.empty())
+          continue;
+      }
+      retained.push_back(copy);
+    }
+    if (!changed)
+      continue;
+    entry["local"] = std::move(retained);
+    if (!SaveDocument(IndexPath(root, title), entry))
+      return false;
+  }
+  folders.erase(folder);
+  return SaveDocument(root + "folders.json", folders);
+}
+
+bool MatchMediaFile(const std::string& folder, const std::string& path, const Title& title)
+{
+  std::unique_lock lock(titleIndexMutex);
+  auto folders = MediaFolders();
+  if (!folders.isMember(folder) || !IsLocalVideo(path, CURL(path)) ||
+      !URIUtils::PathHasParent(path, folder) || title.key.empty())
+    return false;
+  auto& source = folders[folder];
+  source["manual"][path] = title.key;
+  source["unmatched"].erase(path);
+  return AddLocalCopy(ROOT, title, folder, path, LoadIndexEntry(title, ROOT)) &&
+         SaveDocument(std::string(ROOT) + "folders.json", folders);
+}
+
+std::set<std::string> ImportMediaFolder(const std::string& folder, const std::string& root)
 {
   const std::string library = root + "library/";
-  if (!CURL(folder).GetProtocol().empty() || !CURL::IsFullPath(folder) ||
+  const CURL source(folder);
+  if ((!source.GetProtocol().empty() && !source.IsProtocol("smb")) ||
+      !CURL::IsFullPath(folder) || !source.GetUserName().empty() || !source.GetPassWord().empty() ||
       URIUtils::PathHasParent(URIUtils::GetRealPath(folder), library))
     return {};
 
-  CFileItemList files;
-  // shortcut: import top-level movies with a matching NFO, extend for full folder indexing.
-  if (!XFILE::CDirectory::GetDirectory(folder, files, VIDEO_EXTENSIONS, XFILE::DIR_FLAG_DEFAULTS))
+  CFileItemList first;
+  if (!XFILE::CDirectory::GetDirectory(folder, first, VIDEO_EXTENSIONS, XFILE::DIR_FLAG_NO_FILE_DIRS))
     return {};
-
-  static std::mutex importMutex;
-  std::unique_lock lock(importMutex);
-  CFileItemList anchors;
-  if (XFILE::CDirectory::Exists(library))
-    CUtil::GetRecursiveListing(library, anchors, ".mkv");
-  std::map<std::string, std::string> anchorPaths;
-  for (const auto& anchor : anchors)
+  CFileItemList files;
+  std::vector<std::pair<CFileItemPtr, int>> entries;
+  for (const auto& file : first)
+    entries.emplace_back(file, 0);
+  std::set<std::string> visited{folder};
+  while (!entries.empty())
   {
-    const auto title = GetTitle(*anchor, library);
-    if (!title.key.empty())
-      anchorPaths.emplace(title.key, title.path);
+    auto [file, depth] = std::move(entries.back());
+    entries.pop_back();
+    if (!file->m_bIsFolder)
+    {
+      files.Add(file);
+      continue;
+    }
+    const CURL url(file->GetPath());
+    const auto directory = URIUtils::GetRealPath(url.GetWithoutUserDetails());
+    // shortcut: bound traversal depth for SMB aliases or symlink loops, lift with stable VFS IDs.
+    if (depth >= 32 || !URIUtils::PathHasParent(directory, folder) ||
+        URIUtils::PathHasParent(directory, library) || !visited.insert(directory).second)
+      continue;
+    CFileItemList children;
+    if (XFILE::CDirectory::GetDirectory(directory, children, VIDEO_EXTENSIONS,
+                                       XFILE::DIR_FLAG_NO_FILE_DIRS))
+    {
+      for (const auto& child : children)
+        entries.emplace_back(child, depth + 1);
+    }
+  }
+
+  std::unique_lock lock(titleIndexMutex);
+  auto anchorPaths = FindAnchors(library);
+  CVariant folders = ReadJson(root + "folders.json");
+  auto& sourceRecord = folders[folder];
+  std::map<std::string, CVariant> known;
+  for (const auto& [key, path] : anchorPaths)
+  {
+    const auto title = GetTitle(CFileItem(path, false), library);
+    known.emplace(key, LoadIndexEntry(title, root));
   }
 
   std::set<std::string> scanPaths;
   for (const auto& file : files)
   {
-    const std::string path = URIUtils::GetRealPath(file->GetPath());
+    const std::string path = URIUtils::GetRealPath(CURL(file->GetPath()).GetWithoutUserDetails());
     if (file->m_bIsFolder || !IsLocalVideo(path, CURL(path)) ||
         !GetTitle(*file, library).key.empty())
       continue;
 
+    const auto manual = std::as_const(sourceRecord)["manual"][path].asString();
     const std::string nfo = ReadState(URIUtils::ReplaceExtension(path, ".nfo"));
-    CXBMCTinyXML document;
     CVideoInfoTag tag;
-    if (nfo.empty() || !document.Parse(nfo) || !document.RootElement() ||
-        !StringUtils::EqualsNoCase(document.RootElement()->ValueStr(), "movie") ||
-        !tag.Load(document.RootElement()) || tag.m_strTitle.empty() || tag.m_strTitle.size() > 255)
+    CVideoInfoTag show;
+    Title title;
+    CVariant entry;
+    std::string showNfo;
+    if (!manual.empty() && anchorPaths.count(manual))
+      title = GetTitle(CFileItem(anchorPaths.at(manual), false), library);
+    else if (LoadNfo(nfo, tag, "movie"))
+    {
+      const std::string id = tag.GetUniqueID("tmdb");
+      const std::string key = "movie:tmdb:" + id;
+      const auto anchor = anchorPaths.emplace(key, library + "movies/movie-tmdb-" + id + ".mkv");
+      title = {anchor.first->second, key, {}};
+    }
+    else if (LoadNfo(nfo, tag, "episodedetails") && tag.m_iSeason >= 0 && tag.m_iSeason <= 99 &&
+             tag.m_iEpisode > 0 && tag.m_iEpisode <= 999)
+    {
+      for (std::string dir = URIUtils::GetDirectory(path);
+           URIUtils::PathHasParent(dir, folder) || URIUtils::PathEquals(dir, folder, true);
+           dir = URIUtils::GetParentPath(dir))
+      {
+        showNfo = ReadState(dir + "tvshow.nfo");
+        if (LoadNfo(showNfo, show, "tvshow") || URIUtils::PathEquals(dir, folder, true))
+          break;
+      }
+      if (ValidTmdbId(show.GetUniqueID("tmdb")))
+      {
+        const std::string id = tag.GetUniqueID("tmdb");
+        const std::string key = "episode:tmdb:" + id;
+        const std::string marker = StringUtils::Format("s{:02}e{:02}", tag.m_iSeason, tag.m_iEpisode);
+        const std::string showPath = library + "shows/tv-tmdb-" + show.GetUniqueID("tmdb") + "/";
+        const auto anchor = anchorPaths.emplace(key, showPath + "episode-tmdb-" + id + "." +
+                                                         marker + ".mkv");
+        title = GetTitle(CFileItem(anchor.first->second, false), library);
+      }
+    }
+    else if (nfo.empty() && manual.empty())
+    {
+      CVariant evidence;
+      evidence["name"] = path;
+      for (const auto& [key, row] : known)
+      {
+        if (!MatchesFile(evidence, row))
+          continue;
+        if (!title.key.empty())
+        {
+          title = {};
+          break;
+        }
+        title = GetTitle(CFileItem(anchorPaths.at(key), false), library);
+      }
+    }
+    if (title.key.empty())
+    {
+      sourceRecord["unmatched"][path] = true;
       continue;
-
-    const std::string id = tag.GetUniqueID("tmdb");
-    if (id.empty() || id.size() > 20 || id.front() == '0' ||
-        id.find_first_not_of("0123456789") != std::string::npos)
-      continue;
-
-    const std::string key = "movie:tmdb:" + id;
-    const auto anchor = anchorPaths.emplace(key, library + "movies/movie-tmdb-" + id + ".mkv");
-    const Title title{anchor.first->second, key, {}};
-    CVariant entry = LoadIndexEntry(title, root);
-    if (entry["title"].asString().empty())
+    }
+    entry = LoadIndexEntry(title, root);
+    if (entry["title"].asString().empty() && !tag.m_strTitle.empty())
       entry["title"] = tag.m_strTitle;
-    auto& local = entry["local"];
-    if (!local.isArray())
-      local = CVariant(CVariant::VariantTypeArray);
-    if (std::none_of(local.begin_array(), local.end_array(),
-                     [&](const CVariant& item) { return LocalPath(item) == path; }))
-      local.push_back(path);
-
-    std::string json;
-    if (!CJSONVariantWriter::Write(entry, json, true) || json.size() > MAX_RESPONSE ||
-        !WriteState(IndexPath(root, title), json))
+    if (!show.m_strTitle.empty())
+    {
+      entry["seriesId"] = "tmdb:" + show.GetUniqueID("tmdb");
+      if (entry["query"].asString().empty())
+        entry["query"] = show.m_strTitle;
+    }
+    if (!AddLocalCopy(root, title, folder, path, entry))
       continue;
-
+    sourceRecord["unmatched"].erase(path);
     const std::string anchorNfo = URIUtils::ReplaceExtension(title.path, ".nfo");
-    if ((!XFILE::CFile::Exists(anchorNfo) && !WriteState(anchorNfo, nfo)) ||
+    if ((!nfo.empty() && manual.empty() && !XFILE::CFile::Exists(anchorNfo) && !WriteState(anchorNfo, nfo)) ||
         (!XFILE::CFile::Exists(title.path) && !WriteState(title.path, "")))
       continue;
-    scanPaths.insert(URIUtils::GetDirectory(title.path));
+    if (title.episode.empty())
+      scanPaths.insert(URIUtils::GetDirectory(title.path));
+    else
+    {
+      const std::string showPath = URIUtils::GetDirectory(title.path) + "tvshow.nfo";
+      if (!showNfo.empty() && !XFILE::CFile::Exists(showPath) && !WriteState(showPath, showNfo))
+        continue;
+      scanPaths.insert(library + "shows/");
+    }
   }
+  if (sourceRecord.isNull())
+    sourceRecord = CVariant(CVariant::VariantTypeObject);
+  SaveDocument(root + "folders.json", folders);
   return scanPaths;
 }
 
@@ -917,6 +1171,40 @@ Profile GetQualityProfile()
   if (value == "data")
     return Profile::DataSaver;
   return Profile::Balanced;
+}
+
+void ApplySelectionSettings(SelectionPreferences& preferences)
+{
+  const auto settings = CServiceBroker::GetSettingsComponent()->GetSettings();
+  const auto limit = [&](const char* id)
+  {
+    return StringUtils::ToUint32(settings->GetString(id));
+  };
+  preferences.profile = GetQualityProfile();
+  preferences.maxStreamBytes = limit("appliance.streamsize") * 1'000'000'000ULL;
+  preferences.maxStreamBitsPerSecond = limit("appliance.bandwidth") * 1'000'000ULL;
+  preferences.capabilityOverrides.maxResolution = limit("appliance.maxresolution");
+}
+
+DeviceCapabilities GetPlaybackDevice()
+{
+  DeviceCapabilities device;
+  if (const auto* window = CServiceBroker::GetWinSystem())
+  {
+    const auto hdr = window->GetDisplayHDRCapabilities();
+    std::set<std::string> formats;
+    if (hdr.SupportsHDR10())
+      formats.insert("hdr10");
+    if (hdr.SupportsHDR10Plus())
+      formats.insert("hdr10plus");
+    if (hdr.SupportsHLG())
+      formats.insert("hlg");
+    if (hdr.SupportsDolbyVision())
+      formats.insert("dolbyvision");
+    if (!formats.empty())
+      device.hdrFormats = std::move(formats);
+  }
+  return device;
 }
 
 PlaybackLanguage GetPlaybackLanguage(const Title& title,
@@ -1130,6 +1418,447 @@ TitleContext GetTitleContext(const Title& title, const CFileItem& item, const CV
 CVariant LoadProviders()
 {
   return ReadJson(std::string(ROOT) + "providers.json");
+}
+
+bool IsLocalOnly()
+{
+  const auto mode = LoadProviders()["accountMode"].asString();
+  if (mode == "online")
+    return false;
+  return mode == "local" ||
+         CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool("appliance.localonly");
+}
+
+bool IsSetupComplete()
+{
+  return IsLocalOnly() || LoadProviders()["accountMode"].asString() == "online";
+}
+
+CVariant QueryCatalog(const std::string& route, const std::atomic_bool& cancelled)
+{
+  const std::string fixture = LoadProviders()["catalogFixture"].asString();
+  const CURL url(fixture);
+  if (url.IsProtocol("http") && url.GetHostName() == "127.0.0.1")
+    return GetJson(fixture + "/3" + route, cancelled);
+
+  std::string token = ReadState("special://xbmc/system/appliance-tmdb-token");
+  StringUtils::Trim(token);
+  if (!token.empty())
+    return GetJson("https://api.themoviedb.org/3" + route, cancelled, "Authorization: Bearer " + token);
+  // A development key can be supplied through the process environment.
+  const std::string key = CEnvironment::getenv("TMDB_API_KEY");
+  if (key.empty())
+    return {};
+  return GetJson("https://api.themoviedb.org/3" + route +
+                     (route.find('?') == std::string::npos ? "?" : "&") + "api_key=" +
+                     CURL::Encode(key),
+                 cancelled);
+}
+
+std::string CatalogImage(const CVariant& path)
+{
+  const std::string image = path.asString();
+  static const std::regex filename(R"(/[A-Za-z0-9_-]{1,100}\.(jpg|png|webp))");
+  return std::regex_match(image, filename) ? "https://image.tmdb.org/t/p/w500" + image
+                                           : std::string{};
+}
+
+std::shared_ptr<CFileItem> SaveCatalogTitle(const CVariant& details, const CVariant& series)
+{
+  const bool episode = series.isObject();
+  const auto id = ReadId(details["id"]);
+  const auto seriesId = ReadId(series["id"]);
+  const auto season = ReadId(details["season_number"]);
+  const auto number = ReadId(details["episode_number"]);
+  const std::string name = details[episode ? "name" : "title"].asString();
+  const std::string seriesName = series["name"].asString();
+  if (id <= 0 || name.empty() || name.size() > 255 ||
+      (episode && (seriesId <= 0 || seriesName.empty() || seriesName.size() > 255 ||
+                   season < 0 || season > 99 || number <= 0 || number > 999)))
+    return {};
+
+  const std::string root = CSpecialProtocol::TranslatePath(ROOT);
+  const std::string library = root + "library/";
+  const std::string type = episode ? "episode" : "movie";
+  const std::string key = type + ":tmdb:" + std::to_string(id);
+  const std::string marker = episode ? StringUtils::Format("s{:02}e{:02}", season, number) : "";
+  std::unique_lock lock(titleIndexMutex);
+  auto anchors = FindAnchors(library);
+  CVideoDatabase database;
+  if (!database.Open())
+    return {};
+
+  std::string directory = library + "movies/";
+  int showId = -1;
+  if (episode)
+  {
+    directory = library + "shows/tv-tmdb-" + std::to_string(seriesId) + "/";
+    CFileItemList shows;
+    database.GetTvShowsNav("videodb://tvshows/titles/", shows);
+    for (const auto& item : shows)
+    {
+      const auto* tag = item->GetVideoInfoTag();
+      if (tag && tag->GetUniqueID("tmdb") == std::to_string(seriesId) &&
+          URIUtils::PathHasParent(CSpecialProtocol::TranslatePath(tag->m_strPath), library))
+      {
+        showId = tag->m_iDbId;
+        directory = tag->m_strPath;
+        URIUtils::AddSlashAtEnd(directory);
+        break;
+      }
+    }
+    if (showId < 0)
+    {
+      CVideoInfoTag show;
+      show.SetTitle(seriesName);
+      show.SetUniqueID(std::to_string(seriesId), "tmdb", true);
+      show.SetPath(directory);
+      show.SetPlot(series["overview"].asString());
+      show.SetPremieredFromDBDate(series["first_air_date"].asString());
+      const auto poster = CatalogImage(series["poster_path"]);
+      std::map<std::string, std::string> art;
+      if (!poster.empty())
+        art.emplace("poster", poster);
+      if (!XFILE::CDirectory::Create(directory))
+        return {};
+      showId = database.SetDetailsForTvShow({{directory, library + "shows/"}}, show, art, {});
+      if (showId < 0)
+        return {};
+    }
+  }
+
+  const auto [anchor, inserted] = anchors.emplace(
+      key, directory + type + "-tmdb-" + std::to_string(id) + (episode ? "." + marker : "") + ".mkv");
+  const Title title = inserted ? Title{anchor->second, key, marker}
+                                : GetTitle(CFileItem(anchor->second, false), library);
+  const std::string date = details[episode ? "air_date" : "release_date"].asString();
+  const std::string query = episode ? seriesName
+                                  : (date.size() == 10 ? name + " (" + date.substr(0, 4) + ")" : name);
+  CVariant entry = LoadIndexEntry(title, root);
+  entry["title"] = name;
+  entry["query"] = query.size() <= 255 ? query : name;
+  entry["episode"] = title.episode;
+  const auto runtime = std::clamp<int64_t>(ReadId(details["runtime"]), 0, 24 * 60) * 60;
+  if (runtime > 0)
+    entry["runtimeSeconds"] = runtime;
+  const auto& origin = episode ? series : details;
+  if (origin["original_language"].isString())
+    entry["originalLanguage"] = origin["original_language"];
+  if (episode)
+    entry["seriesId"] = "tmdb:" + std::to_string(seriesId);
+  const auto& genres = origin["genres"];
+  if (genres.isArray())
+  {
+    const bool animation = std::any_of(genres.begin_array(), genres.end_array(),
+                                      [](const CVariant& genre) { return ReadId(genre["id"]) == 16; });
+    entry["anime"] = animation && entry["originalLanguage"].asString() == "ja";
+  }
+  std::string json;
+  if (!CJSONVariantWriter::Write(entry, json, true) || json.size() > MAX_RESPONSE ||
+      !WriteState(IndexPath(root, title), json) ||
+      (!XFILE::CFile::Exists(title.path) && !WriteState(title.path, "")))
+    return {};
+
+  CVideoInfoTag tag;
+  int libraryId = episode ? database.GetEpisodeId(title.path) : database.GetMovieId(title.path);
+  if (libraryId < 0)
+  {
+    tag.m_strFileNameAndPath = title.path;
+    tag.m_strPath = URIUtils::GetDirectory(title.path);
+    tag.SetBasePath(title.path);
+    tag.SetTitle(name);
+    tag.SetUniqueID(std::to_string(id), "tmdb", true);
+    tag.SetPlot(details["overview"].asString());
+    tag.SetDuration(static_cast<int>(runtime));
+    tag.SetPremieredFromDBDate(date);
+    std::map<std::string, std::string> art;
+    const auto image = CatalogImage(details[episode ? "still_path" : "poster_path"]);
+    if (!image.empty())
+      art.emplace(episode ? "thumb" : "poster", image);
+    if (episode)
+    {
+      tag.m_iSeason = static_cast<int>(season);
+      tag.m_iEpisode = static_cast<int>(number);
+      tag.m_strShowTitle = seriesName;
+      tag.m_firstAired.SetFromDBDate(date);
+      libraryId = database.SetDetailsForEpisode(tag, art, showId);
+    }
+    else
+      libraryId = database.SetDetailsForMovie(tag, art);
+    if (libraryId < 0)
+      return {};
+  }
+
+  const bool found = episode ? database.GetEpisodeInfo(title.path, tag, libraryId)
+                             : database.GetMovieInfo(title.path, tag, libraryId);
+  if (!found)
+    return {};
+  auto item = std::make_shared<CFileItem>(tag);
+  std::map<std::string, std::string> art;
+  if (database.GetArtForItem(libraryId, tag.m_type, art))
+    item->SetArt(art);
+  return item;
+}
+
+namespace
+{
+struct AccountResponse
+{
+  CVariant body;
+  long status{0};
+};
+
+std::optional<AccountResponse> RequestAccount(CGUIDialogProgress& dialog,
+                                              std::string url,
+                                              std::string header = {},
+                                              std::string post = {})
+{
+  using namespace std::chrono_literals;
+  auto cancelled = std::make_shared<std::atomic_bool>(false);
+  auto request = std::make_shared<std::packaged_task<AccountResponse()>>(
+      [url = std::move(url), header = std::move(header), post = std::move(post), cancelled]
+      {
+        AccountResponse response;
+        response.body = GetJson(url, *cancelled, header, post, &response.status);
+        return response;
+      });
+  auto result = request->get_future();
+  CServiceBroker::GetJobManager()->Submit([request] { (*request)(); }, CJob::PRIORITY_NORMAL);
+  const auto deadline = std::chrono::steady_clock::now() + 6s;
+  while (dialog.IsActive() && !dialog.IsCanceled() && std::chrono::steady_clock::now() < deadline)
+  {
+    if (result.wait_for(10ms) == std::future_status::ready)
+      return result.get();
+    dialog.Progress();
+  }
+  *cancelled = true;
+  return dialog.IsActive() && !dialog.IsCanceled() ? std::optional{AccountResponse{}} : std::nullopt;
+}
+
+bool TokenValid(const std::string& token)
+{
+  return !token.empty() && token.size() <= 512 &&
+         std::all_of(token.begin(), token.end(), [](unsigned char c) { return c > 32 && c < 127; });
+}
+
+bool SaveAccount(const std::string& token)
+{
+  const std::string path = std::string(ROOT) + "providers.json";
+  CVariant providers = ReadJson(path);
+  if (XFILE::CFile::Exists(path) && !providers.isObject())
+    return false;
+  if (token.empty())
+    providers.erase("torboxKey");
+  else
+    providers["torboxKey"] = token;
+  providers["accountMode"] = token.empty() ? "local" : "online";
+  std::string json;
+  return CJSONVariantWriter::Write(providers, json, true) && json.size() <= MAX_RESPONSE &&
+         WriteState(path, json, true);
+}
+
+// Returns a localized error ID, or zero on success or cancellation.
+int PollDeviceCode(CGUIDialogProgress& dialog, const std::string& base, std::string& token)
+{
+  using namespace std::chrono_literals;
+  using Clock = std::chrono::steady_clock;
+  const auto start = RequestAccount(dialog, base + "auth/device/start?app=Pi%20Media%20Appliance");
+  if (!start)
+    return 0;
+  const CVariant& data = start->body["data"];
+  const auto interval = ReadId(data["interval"]);
+  const auto expires = ReadId(data["expires_in"]);
+  const std::string deviceCode = data["device_code"].asString();
+  const std::string code = data["code"].asString();
+  const std::string link = data["verification_url"].asString();
+  const CURL verification(link);
+  if (start->status != 200 || !start->body["success"].asBoolean() || interval < 1 ||
+      expires < interval || expires > 3600 || !TokenValid(deviceCode) || !TokenValid(code) ||
+      code.size() > 20 || link.size() > 160 || !IsHttp(verification) ||
+      !verification.IsProtocol("https") || verification.GetHostName() != "torbox.app")
+    return start->status == 429 ? 42044 : 42040;
+
+  CVariant payload;
+  payload["device_code"] = deviceCode;
+  std::string post;
+  if (!CJSONVariantWriter::Write(payload, post, true))
+    return 42040;
+
+  const bool showQr = data["friendly_verification_url"].asString() == TORBOX_VERIFICATION;
+  dialog.SetProperty("ApplianceTorBoxQr", showQr);
+  const auto instructions = StringUtils::Format(g_localizeStrings.Get(42041),
+                                                showQr ? TORBOX_VERIFICATION : link, code);
+  dialog.SetText(CVariant{instructions});
+  auto delay = std::chrono::seconds{interval};
+  const auto deadline = Clock::now() + std::chrono::seconds{expires};
+  auto next = Clock::now() + delay;
+  while (dialog.IsActive() && !dialog.IsCanceled() && Clock::now() < deadline)
+  {
+    if (Clock::now() < next)
+    {
+      std::this_thread::sleep_for(10ms);
+      dialog.Progress();
+      continue;
+    }
+
+    const auto response = RequestAccount(dialog, base + "auth/device/token",
+                                         "Content-Type: application/json", post);
+    if (!response)
+      return 0;
+    if (Clock::now() >= deadline)
+      break;
+    if (response->status == 200 && response->body["success"].asBoolean())
+    {
+      const auto& credentials = response->body["data"];
+      token = credentials.isObject() ? credentials["token"].asString() : credentials.asString();
+      if (token.empty() && credentials.isObject())
+        token = credentials["api_key"].asString();
+      return TokenValid(token) ? 0 : 42040;
+    }
+    const std::string error = response->body["error"].asString();
+    if (error == "ITEM_NOT_FOUND")
+      return 42042;
+    if (error == "DEVICE_CODE_USED")
+      return 42043;
+    if (response->status == 429)
+    {
+      delay = std::min(delay * 2, std::chrono::seconds{expires});
+      dialog.SetText(CVariant{StringUtils::Format("{}\n{}", instructions,
+                                                 g_localizeStrings.Get(42044))});
+    }
+    else if (error != "DEVICE_CODE_NOT_USED")
+      return 42040;
+    next = Clock::now() + delay;
+  }
+  return dialog.IsActive() && !dialog.IsCanceled() ? 42042 : 0;
+}
+} // namespace
+
+void ConfigureProwlarr()
+{
+  const auto& profiles = *CServiceBroker::GetSettingsComponent()->GetProfileManager();
+  const int profile = profiles.GetCurrentProfileId();
+  const auto original = LoadProviders();
+  const auto previous = original["prowlarr"].asString();
+  std::string url = previous;
+  if (!CGUIKeyboardFactory::ShowAndGetInput(url, CVariant{42070}, true))
+    return;
+  StringUtils::Trim(url);
+  URIUtils::RemoveSlashAtEnd(url);
+  const CURL endpoint(url);
+  if (!url.empty() && (!IsHttp(endpoint) || !endpoint.GetOptions().empty() ||
+                       url.find_first_of("\r\n#") != std::string::npos))
+  {
+    CGUIDialogOK::ShowAndGetInput(CVariant{42069}, CVariant{42072});
+    return;
+  }
+
+  std::string token;
+  if (!url.empty() &&
+      !CGUIKeyboardFactory::ShowAndGetInput(token, CVariant{42071}, url == previous, true))
+    return;
+  if (profile != profiles.GetCurrentProfileId())
+    return;
+  if (!url.empty() && token.empty())
+    token = original["prowlarrKey"].asString();
+  if (!url.empty() && !TokenValid(token))
+  {
+    CGUIDialogOK::ShowAndGetInput(CVariant{42069}, CVariant{42072});
+    return;
+  }
+
+  const std::string path = std::string(ROOT) + "providers.json";
+  CVariant providers = ReadJson(path);
+  if (XFILE::CFile::Exists(path) && !providers.isObject())
+  {
+    CGUIDialogOK::ShowAndGetInput(CVariant{42069}, CVariant{42032});
+    return;
+  }
+  if (url.empty())
+  {
+    providers.erase("prowlarr");
+    providers.erase("prowlarrKey");
+  }
+  else
+  {
+    providers["prowlarr"] = url;
+    providers["prowlarrKey"] = token;
+  }
+  std::string json;
+  if (!CJSONVariantWriter::Write(providers, json, true) || json.size() > MAX_RESPONSE ||
+      !WriteState(path, json, true))
+    CGUIDialogOK::ShowAndGetInput(CVariant{42069}, CVariant{42032});
+}
+
+bool ConfigureTorBox()
+{
+  auto& windows = CServiceBroker::GetGUI()->GetWindowManager();
+  auto* choices = windows.GetWindow<CGUIDialogSelect>(WINDOW_DIALOG_SELECT);
+  choices->Reset();
+  choices->SetHeading(CVariant{42033});
+  choices->Add(g_localizeStrings.Get(42034));
+  choices->Add(g_localizeStrings.Get(42035));
+  const bool linked = !LoadProviders()["torboxKey"].asString().empty();
+  if (linked)
+    choices->Add(g_localizeStrings.Get(42036));
+  choices->Open();
+  if (!choices->IsConfirmed())
+    return false;
+
+  const int action = choices->GetSelectedItem();
+  if (action == 2)
+  {
+    if (SaveAccount({}))
+      return true;
+    CGUIDialogOK::ShowAndGetInput(CVariant{42033}, CVariant{42032});
+    return false;
+  }
+
+  const int profile = CServiceBroker::GetSettingsComponent()->GetProfileManager()->GetCurrentProfileId();
+  const CVariant providers = LoadProviders();
+  const std::string fixture = providers["fixture"].asString();
+  // A profile fixture can replace the live account endpoint only on loopback.
+  const CURL fixtureUrl(fixture);
+  const bool localFixture = fixtureUrl.IsProtocol("http") && fixtureUrl.GetHostName() == "127.0.0.1";
+  const std::string base = (localFixture ? fixture : TORBOX) + std::string("/v1/api/user/");
+  std::string token;
+  if (action == 1 && !CGUIKeyboardFactory::ShowAndGetInput(token, CVariant{42035}, false, true))
+    return false;
+  auto* progress = windows.GetWindow<CGUIDialogProgress>(WINDOW_DIALOG_PROGRESS);
+  progress->Reset();
+  progress->SetProperty("ApplianceTorBoxQr", false);
+  progress->SetHeading(CVariant{42033});
+  progress->SetText(CVariant{42037});
+  progress->Open();
+  progress->ShowProgressBar(false);
+  int error = action == 0 ? PollDeviceCode(*progress, base, token) : 0;
+  progress->SetProperty("ApplianceTorBoxQr", false);
+  bool validated = false;
+  if (error == 0 && !token.empty() && progress->IsActive() && !progress->IsCanceled())
+  {
+    progress->SetText(CVariant{42037});
+    const auto check = TokenValid(token)
+                           ? RequestAccount(*progress, base + "me", "Authorization: Bearer " + token)
+                           : std::optional{AccountResponse{}};
+    if (check)
+    {
+      validated = check->status == 200 && check->body["success"].asBoolean();
+      if (!validated)
+        error = check->status == 429 ? 42044 : 42038;
+    }
+  }
+  progress->Close(true);
+  if (profile != CServiceBroker::GetSettingsComponent()->GetProfileManager()->GetCurrentProfileId())
+    return false;
+  if (validated)
+  {
+    if (SaveAccount(token))
+      return true;
+    error = 42032;
+  }
+  if (error)
+    CGUIDialogOK::ShowAndGetInput(CVariant{42033}, CVariant{error});
+  return false;
 }
 
 std::vector<FileCandidate> LocalFiles(const CVariant& entry, const Title& title)

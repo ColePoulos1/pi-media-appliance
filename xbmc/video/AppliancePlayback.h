@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -250,8 +251,13 @@ bool HasKnownLanguage(const std::vector<RankedFile>& files,
 
 Title GetTitle(const CFileItem& item);
 CVariant LoadIndexEntry(const Title& title);
-std::set<std::string> ImportMovieFolder(const std::string& folder, const std::string& root);
+std::set<std::string> ImportMediaFolder(const std::string& folder, const std::string& root);
+CVariant MediaFolders();
+bool RemoveMediaFolder(const std::string& folder);
+bool MatchMediaFile(const std::string& folder, const std::string& path, const Title& title);
 Profile GetQualityProfile();
+void ApplySelectionSettings(SelectionPreferences& preferences);
+DeviceCapabilities GetPlaybackDevice();
 PlaybackLanguage GetPlaybackLanguage(const Title& title,
                                      const CFileItem& item,
                                      const CVariant& entry);
@@ -271,6 +277,13 @@ bool VerifyPlaybackTracks(CApplicationPlayer& player,
                           const PlaybackTracks& tracks);
 TitleContext GetTitleContext(const Title& title, const CFileItem& item, const CVariant& entry);
 CVariant LoadProviders();
+bool IsLocalOnly();
+bool IsSetupComplete();
+bool ConfigureTorBox();
+void ConfigureProwlarr();
+CVariant QueryCatalog(const std::string& route, const std::atomic_bool& cancelled);
+std::string CatalogImage(const CVariant& path);
+std::shared_ptr<CFileItem> SaveCatalogTitle(const CVariant& details, const CVariant& series);
 std::vector<FileCandidate> LocalFiles(const CVariant& entry, const Title& title);
 CVariant SelectFile(const CVariant& files, const CVariant& entry);
 std::vector<FileCandidate> Discover(const CVariant& entry,

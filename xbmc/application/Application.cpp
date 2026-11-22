@@ -2394,6 +2394,7 @@ struct CApplication::AppliancePlayback
   KODI::APPLIANCE::PlaybackLanguage language;
   KODI::APPLIANCE::LanguageChoice choice{KODI::APPLIANCE::LanguageChoice::Ordinary};
   KODI::APPLIANCE::SelectionPreferences preferences;
+  KODI::APPLIANCE::DeviceCapabilities device;
   std::vector<KODI::APPLIANCE::FileCandidate> localFiles;
   std::vector<KODI::APPLIANCE::FileCandidate> remoteFiles;
   std::vector<KODI::APPLIANCE::RankedFile> local;
@@ -2428,7 +2429,7 @@ struct CApplication::AppliancePlayback
     using namespace KODI::APPLIANCE;
     auto eligible = preferences;
     eligible.skipped.insert(trackMismatches.begin(), trackMismatches.end());
-    auto ranked = RankFiles(files, context, eligible, {});
+    auto ranked = RankFiles(files, context, eligible, device);
     PreferWorkingFile(ranked, preferred);
     return ranked;
   }
@@ -2499,7 +2500,8 @@ bool CApplication::PlayFile(CFileItem item, const std::string& player, bool bRes
   if (remember)
     RememberLanguageChoice(attempt->language, *choice);
   attempt->choice = *choice;
-  attempt->preferences.profile = GetQualityProfile();
+  ApplySelectionSettings(attempt->preferences);
+  attempt->device = GetPlaybackDevice();
   SetLanguageRequirements(attempt->preferences, attempt->language, attempt->choice);
   const auto now = PlaybackClock::now();
   if (const auto* stop = m_applianceHistory->RecentStop(profileId, title.key, now))
@@ -2567,8 +2569,7 @@ void CApplication::TryApplianceSource()
   }
 
   const auto now = PlaybackClock::now();
-  if (!attempt->budget.CanTry(now) ||
-      CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool("appliance.localonly"))
+  if (!attempt->budget.CanTry(now) || IsLocalOnly())
   {
     ShowApplianceExhaustion();
     return;
@@ -2641,8 +2642,8 @@ void CApplication::TryApplianceSource()
     auto preferences = attempt->preferences;
     SetLanguageRequirements(preferences, attempt->language, alternative);
     preferences.skipped.insert(attempt->failed.begin(), attempt->failed.end());
-    const auto local = RankFiles(attempt->localFiles, attempt->context, preferences, {});
-    const auto remote = RankFiles(attempt->remoteFiles, attempt->context, preferences, {});
+    const auto local = RankFiles(attempt->localFiles, attempt->context, preferences, attempt->device);
+    const auto remote = RankFiles(attempt->remoteFiles, attempt->context, preferences, attempt->device);
     const auto hasAlternative = [&](const auto& files)
     {
       return HasKnownLanguage(files, preferences) ||
@@ -3309,6 +3310,11 @@ bool CApplication::OnMessage(CGUIMessage& message)
         return true;
       }
       attempt->lookup.reset();
+      if (KODI::APPLIANCE::IsLocalOnly())
+      {
+        ShowApplianceExhaustion();
+        return true;
+      }
       if (auto result = std::static_pointer_cast<AppliancePlayback::Discovery>(message.GetItem()))
       {
         attempt->discovered = true;

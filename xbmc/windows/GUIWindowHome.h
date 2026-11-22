@@ -12,8 +12,9 @@
 #include "guilib/GUIWindow.h"
 #include "interfaces/IAnnouncer.h"
 #include "utils/Job.h"
+#include "utils/Variant.h"
 
-class CVariant;
+#include <atomic>
 
 class CGUIWindowHome :
       public CGUIWindow,
@@ -34,11 +35,29 @@ public:
 
   void OnJobComplete(unsigned int jobID, bool success, CJob *job) override;
 private:
+  enum class CatalogRequest
+  {
+    Search,
+    Show,
+    Season,
+    Movie
+  };
+
+  void OnDeinitWindow(int nextWindowID) override;
   void ShowTitles();
+  void OpenCatalogItem(const CFileItem& item);
+  void RequestCatalog(CatalogRequest request, const std::string& route);
+  void CancelCatalog();
   void OpenApplianceSettings();
-  void AddMediaFolder();
+  void OpenMediaFolders();
+  void BrowseUnmatched(const std::string& folder, const CVariant& unmatched);
+  void ScanMediaFolder(std::string folder);
 
   CFileItemList m_titles;
+  CVariant m_catalogSearch;
+  CVariant m_catalogShow;
+  CVariant m_catalogSeason;
+  std::shared_ptr<std::atomic_bool> m_catalogRequest;
   std::string m_search;
   int m_titleView{0};
   bool m_importing{false};

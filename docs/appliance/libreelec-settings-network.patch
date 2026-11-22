@@ -1,0 +1,79 @@
+--- a/default.py
++++ b/default.py
+@@ -4,6 +4,7 @@
+ # Copyright (C) 2019-present Team LibreELEC (https://libreelec.tv)
+ 
+ import socket
++import sys
+ 
+ import xbmc
+ import xbmcaddon
+@@ -18,7 +19,8 @@
+ try:
+     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+     sock.connect('/var/run/service.libreelec.settings.sock')
+-    sock.send(bytes('openConfigurationWindow', 'utf-8'))
++    command = 'openNetworkWindow' if sys.argv[1:] == ['network'] else 'openConfigurationWindow'
++    sock.send(command.encode('utf-8'))
+     sock.close()
+ except Exception as e:
+     xbmc.executebuiltin(f'Notification("LibreELEC", "{_(32390)}", 5000, "{__media__}/icon.png"')
+--- a/service.py
++++ b/service.py
+@@ -37,20 +37,18 @@
+     @log.log_function()
+     def run(self):
+         if oe.read_setting('libreelec', 'wizard_completed') == None:
+-            threading.Thread(target=oe.openWizard).start()
++            # The appliance Home owns first-run setup.
++            oe.write_setting('libreelec', 'wizard_completed', 'True')
+         while self.stopped == False:
+             log.log(f'Waiting', log.INFO)
+             conn, addr = self.sock.accept()
+             message = (conn.recv(1024)).decode('utf-8')
+             conn.close()
+             log.log(f'Received {message}', log.INFO)
+-            if message == 'openConfigurationWindow':
+-                if not hasattr(oe, 'winOeMain'):
+-                    threading.Thread(target=oe.openConfigurationWindow).start()
+-                else:
+-                    if oe.winOeMain.visible != True:
+-                        threading.Thread(
+-                            target=oe.openConfigurationWindow).start()
++            if message in ('openConfigurationWindow', 'openNetworkWindow'):
++                if not getattr(getattr(oe, 'winOeMain', None), 'visible', False):
++                    threading.Thread(target=oe.openConfigurationWindow,
++                                     args=(message == 'openNetworkWindow',)).start()
+             if message == 'exit':
+                 self.stopped = True
+ 
+--- a/resources/lib/oe.py
++++ b/resources/lib/oe.py
+@@ -483,7 +483,7 @@
+ 
+ 
+ @log.log_function()
+-def openConfigurationWindow():
++def openConfigurationWindow(network_only=False):
+     global winOeMain, __cwd__, __oe__, dictModules, PIN
+     match = True
+ 
+@@ -518,6 +518,7 @@
+ 
+     if match == True:
+         winOeMain = oeWindows.mainWindow('service-LibreELEC-Settings-mainWindow.xml', __cwd__, 'Default', oeMain=__oe__)
++        winOeMain.network_only = network_only
+         winOeMain.doModal()
+         for strModule in dictModules:
+             dictModules[strModule].exit()
+--- a/resources/lib/oeWindows.py
++++ b/resources/lib/oeWindows.py
+@@ -74,6 +74,8 @@
+         self.setProperty('build', oe.BUILD)
+         oe.winOeMain = self
+         for strModule in sorted(oe.dictModules, key=lambda x: list(oe.dictModules[x].menu.keys())):
++            if getattr(self, 'network_only', False) and strModule != 'connman':
++                continue
+             module = oe.dictModules[strModule]
+             log.log(f'init module: {strModule}', log.DEBUG)
+             if module.ENABLED:
