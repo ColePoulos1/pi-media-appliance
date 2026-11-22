@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "FileItem.h"
 #include "guilib/GUIWindow.h"
 #include "interfaces/IAnnouncer.h"
 #include "utils/Job.h"
@@ -33,6 +34,15 @@ public:
 
   void OnJobComplete(unsigned int jobID, bool success, CJob *job) override;
 private:
+  void ShowTitles();
+  void OpenApplianceSettings();
+  void AddMediaFolder();
+
+  CFileItemList m_titles;
+  std::string m_search;
+  int m_titleView{0};
+  bool m_importing{false};
+
   int m_updateRA; // flag for which recently added items needs to be queried
   void AddRecentlyAddedJobs(int flag);
 

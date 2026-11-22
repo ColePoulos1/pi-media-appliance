@@ -2567,7 +2567,8 @@ void CApplication::TryApplianceSource()
   }
 
   const auto now = PlaybackClock::now();
-  if (!attempt->budget.CanTry(now))
+  if (!attempt->budget.CanTry(now) ||
+      CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool("appliance.localonly"))
   {
     ShowApplianceExhaustion();
     return;

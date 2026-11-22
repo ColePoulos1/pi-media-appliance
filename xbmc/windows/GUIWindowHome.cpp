@@ -9,23 +9,60 @@
 #include "GUIWindowHome.h"
 
 #include "ServiceBroker.h"
+#include "addons/AddonManager.h"
+#include "addons/Scraper.h"
 #include "application/ApplicationComponents.h"
 #include "application/ApplicationPlayer.h"
+#include "dialogs/GUIDialogFileBrowser.h"
+#include "dialogs/GUIDialogOK.h"
+#include "dialogs/GUIDialogSelect.h"
+#include "filesystem/Directory.h"
+#include "filesystem/SpecialProtocol.h"
 #include "guilib/GUIComponent.h"
+#include "guilib/GUIKeyboardFactory.h"
 #include "guilib/GUIWindowManager.h"
+#include "guilib/LocalizeStrings.h"
 #include "guilib/WindowIDs.h"
 #include "input/actions/Action.h"
 #include "input/actions/ActionIDs.h"
 #include "interfaces/AnnouncementManager.h"
+#include "profiles/ProfileManager.h"
 #include "settings/AdvancedSettings.h"
+#include "settings/Settings.h"
 #include "settings/SettingsComponent.h"
+#include "storage/MediaManager.h"
 #include "utils/JobManager.h"
 #include "utils/RecentlyAddedJob.h"
 #include "utils/StringUtils.h"
+#include "utils/URIUtils.h"
 #include "utils/Variant.h"
 #include "utils/log.h"
+#include "video/AppliancePlayback.h"
+#include "video/Bookmark.h"
+#include "video/VideoDatabase.h"
+#include "video/VideoInfoScanner.h"
+#include "video/VideoInfoTag.h"
+#include "video/VideoLibraryQueue.h"
+#include "video/dialogs/GUIDialogVideoInfo.h"
 
 #include <mutex>
+
+namespace
+{
+constexpr int USE_LOCAL_MEDIA = 10;
+constexpr int SEARCH = 11;
+constexpr int CONTINUE_WATCHING = 13;
+constexpr int APPLIANCE_SETTINGS = 14;
+constexpr int TITLE_LIST = 20;
+constexpr int IMPORT_FINISHED = GUI_MSG_USER + 1;
+constexpr char LOCAL_ONLY[] = "appliance.localonly";
+
+struct FolderImport : public CGUIListItem
+{
+  std::string root;
+  std::set<std::string> paths;
+};
+} // namespace
 
 CGUIWindowHome::CGUIWindowHome(void) : CGUIWindow(WINDOW_HOME, "Home.xml")
 {
@@ -56,6 +93,15 @@ bool CGUIWindowHome::OnAction(const CAction &action)
       return true;
     }
   }
+  if ((action.GetID() == ACTION_NAV_BACK || action.GetID() == ACTION_PREVIOUS_MENU) && m_titleView)
+  {
+    SET_CONTROL_FOCUS(m_titleView, 0);
+    SET_CONTROL_HIDDEN(TITLE_LIST);
+    m_titleView = 0;
+    SetProperty("ApplianceSection", std::string{});
+    SetProperty("ApplianceEmpty", std::string{});
+    return true;
+  }
   return CGUIWindow::OnAction(action);
 }
 
@@ -68,7 +114,117 @@ void CGUIWindowHome::OnInitWindow()
     m_updateRA = (Audio | Video | Totals);
   AddRecentlyAddedJobs( m_updateRA );
 
+  const bool localOnly = CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(LOCAL_ONLY);
+  SetProperty("ApplianceLocalOnly", localOnly);
   CGUIWindow::OnInitWindow();
+  if (!localOnly)
+  {
+    SET_CONTROL_FOCUS(USE_LOCAL_MEDIA, 0);
+  }
+  if (m_titleView)
+    ShowTitles();
+  else
+  {
+    SET_CONTROL_HIDDEN(TITLE_LIST);
+  }
+}
+
+void CGUIWindowHome::ShowTitles()
+{
+  CGUIMessage selected(GUI_MSG_ITEM_SELECTED, GetID(), TITLE_LIST);
+  OnMessage(selected);
+  const int index = selected.GetParam1();
+  const auto current = index >= 0 && index < m_titles.Size() ? m_titles.Get(index) : nullptr;
+
+  m_titles.Clear();
+  CVideoDatabase database;
+  if (database.Open())
+  {
+    CFileItemList movies;
+    CFileItemList episodes;
+    database.GetMoviesNav("videodb://movies/titles/", movies);
+    database.GetEpisodesNav("videodb://tvshows/titles/-1/-1/", episodes);
+    for (const auto* items : {&movies, &episodes})
+    {
+      for (const auto& item : *items)
+      {
+        if (KODI::APPLIANCE::GetTitle(*item).key.empty())
+          continue;
+        if (m_titleView == CONTINUE_WATCHING
+                ? item->GetVideoInfoTag()->GetResumePoint().IsPartWay()
+                : StringUtils::FindWords(item->GetLabel().c_str(), m_search.c_str()) !=
+                      std::string::npos)
+          m_titles.Add(item);
+      }
+    }
+  }
+  int restore = 0;
+  for (int i = 0; current && i < m_titles.Size(); ++i)
+  {
+    if (m_titles.Get(i)->IsPath(current->GetPath()))
+      restore = i;
+  }
+  SetProperty("ApplianceSection", g_localizeStrings.Get(m_titleView == SEARCH ? 137 : 42025));
+  SetProperty("ApplianceEmpty", m_titles.IsEmpty()
+                                    ? g_localizeStrings.Get(m_titleView == SEARCH ? 42028 : 42029)
+                                    : std::string{});
+  CGUIMessage bind(GUI_MSG_LABEL_BIND, GetID(), TITLE_LIST, restore);
+  bind.SetPointer(&m_titles);
+  OnMessage(bind);
+  if (m_titles.IsEmpty() && GetFocusedControlID() == TITLE_LIST)
+  {
+    SET_CONTROL_FOCUS(m_titleView, 0);
+  }
+  CGUIMessage visibility(m_titles.IsEmpty() ? GUI_MSG_HIDDEN : GUI_MSG_VISIBLE, GetID(), TITLE_LIST);
+  OnMessage(visibility);
+}
+
+void CGUIWindowHome::OpenApplianceSettings()
+{
+  auto* dialog = CServiceBroker::GetGUI()->GetWindowManager().GetWindow<CGUIDialogSelect>(
+      WINDOW_DIALOG_SELECT);
+  dialog->Reset();
+  dialog->SetHeading(CVariant{5});
+  dialog->Add(g_localizeStrings.Get(42026));
+  dialog->Open();
+  if (!dialog->IsConfirmed())
+    return;
+
+  dialog->Reset();
+  dialog->SetHeading(CVariant{42026});
+  dialog->Add(g_localizeStrings.Get(42027));
+  dialog->Open();
+  if (dialog->IsConfirmed())
+    AddMediaFolder();
+}
+
+void CGUIWindowHome::AddMediaFolder()
+{
+  if (m_importing || CVideoLibraryQueue::GetInstance().IsScanningLibrary())
+    return;
+
+  VECSOURCES drives;
+  auto& media = CServiceBroker::GetMediaManager();
+  media.GetRemovableDrives(drives);
+  media.GetLocalDrives(drives);
+  std::string folder;
+  if (!CGUIDialogFileBrowser::ShowAndGetDirectory(drives, g_localizeStrings.Get(42027), folder))
+    return;
+
+  m_importing = true;
+  SetProperty("ApplianceImport", g_localizeStrings.Get(42030));
+  const int profile =
+      CServiceBroker::GetSettingsComponent()->GetProfileManager()->GetCurrentProfileId();
+  CServiceBroker::GetJobManager()->Submit(
+      [folder = CSpecialProtocol::TranslatePath(folder), profile,
+       root = CSpecialProtocol::TranslatePath("special://profile/appliance/")]()
+      {
+        auto result = std::make_shared<FolderImport>();
+        result->root = root;
+        result->paths = KODI::APPLIANCE::ImportMovieFolder(folder, root);
+        CGUIMessage message(IMPORT_FINISHED, 0, 0, profile, 0, result);
+        CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(message, WINDOW_HOME);
+      });
 }
 
 void CGUIWindowHome::Announce(ANNOUNCEMENT::AnnouncementFlag flag,
@@ -163,6 +319,94 @@ bool CGUIWindowHome::OnMessage(CGUIMessage& message)
 {
   switch ( message.GetMessage() )
   {
+  case GUI_MSG_CLICKED:
+    switch (message.GetSenderId())
+    {
+      case USE_LOCAL_MEDIA:
+      {
+        auto settings = CServiceBroker::GetSettingsComponent()->GetSettings();
+        if (!settings->SetBool(LOCAL_ONLY, true) || !settings->Save())
+        {
+          settings->SetBool(LOCAL_ONLY, false);
+          CGUIDialogOK::ShowAndGetInput(CVariant{42024}, CVariant{42032});
+          return true;
+        }
+        SetProperty("ApplianceLocalOnly", true);
+        SET_CONTROL_FOCUS(SEARCH, 0);
+        return true;
+      }
+      case SEARCH:
+      {
+        std::string query = m_search;
+        if (!CGUIKeyboardFactory::ShowAndGetInput(query, CVariant{137}, true))
+          return true;
+        StringUtils::Trim(query);
+        StringUtils::ToLower(query);
+        m_search = std::move(query);
+        [[fallthrough]];
+      }
+      case CONTINUE_WATCHING:
+        m_titleView = message.GetSenderId();
+        ShowTitles();
+        if (!m_titles.IsEmpty())
+        {
+          SET_CONTROL_FOCUS(TITLE_LIST, 0);
+        }
+        return true;
+      case APPLIANCE_SETTINGS:
+        OpenApplianceSettings();
+        return true;
+      case TITLE_LIST:
+      {
+        if (message.GetParam1() != ACTION_SELECT_ITEM &&
+            message.GetParam1() != ACTION_MOUSE_LEFT_CLICK)
+          break;
+        CGUIMessage selected(GUI_MSG_ITEM_SELECTED, GetID(), TITLE_LIST);
+        OnMessage(selected);
+        const int index = selected.GetParam1();
+        if (index >= 0 && index < m_titles.Size())
+          CGUIDialogVideoInfo::ShowFor(*m_titles.Get(index));
+        return true;
+      }
+    }
+    break;
+  case IMPORT_FINISHED:
+  {
+    m_importing = false;
+    SetProperty("ApplianceImport", std::string{});
+    if (message.GetParam1() !=
+        CServiceBroker::GetSettingsComponent()->GetProfileManager()->GetCurrentProfileId())
+      return true;
+    const auto result = std::static_pointer_cast<FolderImport>(message.GetItem());
+    if (result->paths.empty())
+    {
+      SetProperty("ApplianceImport", g_localizeStrings.Get(42031));
+      return true;
+    }
+
+    CVideoDatabase database;
+    ADDON::AddonPtr addon;
+    if (!database.Open() ||
+        !CServiceBroker::GetAddonMgr().GetAddon("metadata.local", addon, ADDON::OnlyEnabled::CHOICE_YES))
+    {
+      SetProperty("ApplianceImport", g_localizeStrings.Get(42032));
+      return true;
+    }
+    auto scraper = std::static_pointer_cast<ADDON::CScraper>(addon);
+    const std::string movies = result->root + "library/movies/";
+    const std::string shows = result->root + "library/shows/";
+    if (XFILE::CDirectory::Create(shows) && scraper->SetPathSettings(CONTENT_TVSHOWS, ""))
+      database.SetScraperForPath(shows, scraper, VIDEO::SScanSettings{});
+    scraper->SetPathSettings(CONTENT_MOVIES, "");
+    database.SetScraperForPath(movies, scraper, VIDEO::SScanSettings{});
+    for (const auto& path : result->paths)
+    {
+      if (!database.GetScraperForPath(path))
+        database.SetScraperForPath(path, scraper, VIDEO::SScanSettings{});
+      CVideoLibraryQueue::GetInstance().ScanLibrary(path, false, false);
+    }
+    return true;
+  }
   case GUI_MSG_NOTIFY_ALL:
     if (message.GetParam1() == GUI_MSG_WINDOW_RESET || message.GetParam1() == GUI_MSG_REFRESH_THUMBS)
     {
@@ -172,6 +416,18 @@ bool CGUIWindowHome::OnMessage(CGUIMessage& message)
         AddRecentlyAddedJobs(updateRA);
       else
         m_updateRA |= updateRA;
+
+      if (message.GetParam1() == GUI_MSG_WINDOW_RESET)
+      {
+        m_titleView = 0;
+        m_search.clear();
+        m_titles.Clear();
+        SetProperty("ApplianceSection", std::string{});
+        SetProperty("ApplianceEmpty", std::string{});
+        SetProperty("ApplianceImport", std::string{});
+      }
+      else if (IsActive() && m_titleView)
+        ShowTitles();
     }
     break;
 

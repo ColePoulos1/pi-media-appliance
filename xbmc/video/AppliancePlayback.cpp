@@ -12,6 +12,7 @@
 #include "LangInfo.h"
 #include "ServiceBroker.h"
 #include "URL.h"
+#include "Util.h"
 #include "application/ApplicationPlayer.h"
 #include "cores/IPlayer.h"
 #include "cores/VideoPlayer/Interface/StreamInfo.h"
@@ -28,9 +29,11 @@
 #include "settings/SettingsComponent.h"
 #include "utils/Digest.h"
 #include "utils/JSONVariantParser.h"
+#include "utils/JSONVariantWriter.h"
 #include "utils/LangCodeExpander.h"
 #include "utils/StringUtils.h"
 #include "utils/URIUtils.h"
+#include "utils/XBMCTinyXML.h"
 #include "utils/log.h"
 #include "video/VideoDatabase.h"
 #include "video/VideoInfoTag.h"
@@ -42,6 +45,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <set>
 #include <tuple>
@@ -166,7 +170,7 @@ TrackEvidence VerifiedLanguages(const CVariant& values)
   return tracks;
 }
 
-CVariant ReadJson(const std::string& path)
+std::string ReadState(const std::string& path)
 {
   XFILE::CFile file;
   if (!file.Open(path))
@@ -176,9 +180,16 @@ CVariant ReadJson(const std::string& path)
   if (length <= 0 || length > static_cast<int64_t>(MAX_RESPONSE))
     return {};
   std::string data(static_cast<size_t>(length), '\0');
+  if (file.Read(data.data(), data.size()) != static_cast<ssize_t>(data.size()))
+    return {};
+  return data;
+}
+
+CVariant ReadJson(const std::string& path)
+{
+  const std::string data = ReadState(path);
   CVariant json;
-  if (file.Read(data.data(), data.size()) != static_cast<ssize_t>(data.size()) ||
-      !CJSONVariantParser::Parse(data, json))
+  if (data.empty() || !CJSONVariantParser::Parse(data, json))
     return {};
   return json;
 }
@@ -756,7 +767,9 @@ bool HasKnownLanguage(const std::vector<RankedFile>& files, const SelectionPrefe
   return false;
 }
 
-Title GetTitle(const CFileItem& item)
+namespace
+{
+Title GetTitle(const CFileItem& item, const std::string& library)
 {
   if (item.m_bIsFolder)
     return {};
@@ -764,7 +777,6 @@ Title GetTitle(const CFileItem& item)
   const std::string& path = item.IsVideoDb() && item.HasVideoInfoTag()
                                 ? item.GetVideoInfoTag()->m_strFileNameAndPath
                                 : item.GetPath();
-  const std::string library = std::string(ROOT) + "library/";
   const std::string translated = URIUtils::GetRealPath(CSpecialProtocol::TranslatePath(path));
   if (!URIUtils::PathHasParent(translated,
                                URIUtils::GetRealPath(CSpecialProtocol::TranslatePath(library))))
@@ -786,14 +798,114 @@ Title GetTitle(const CFileItem& item)
   return {path, type + ":tmdb:" + match[2].str(), episode};
 }
 
-CVariant LoadIndexEntry(const Title& title)
+std::string IndexPath(const std::string& root, const Title& title)
 {
-  const CVariant index = ReadJson(std::string(ROOT) + "index.json");
-  const CVariant& entry = index[title.key];
+  std::string name = title.key;
+  StringUtils::Replace(name, ':', '-');
+  return root + "index/" + name + ".json";
+}
+
+CVariant LoadIndexEntry(const Title& title, const std::string& root)
+{
+  CVariant entry = ReadJson(IndexPath(root, title));
+  if (!entry.isObject())
+  {
+    const CVariant legacy = ReadJson(root + "index.json");
+    entry = legacy[title.key];
+  }
   if (!entry.isObject() || entry["episode"].asString() != title.episode ||
       entry["title"].asString().size() > 255 || entry["query"].asString().size() > 255)
     return {};
   return entry;
+}
+
+std::string LocalPath(const CVariant& item)
+{
+  return item.isObject() ? item["path"].asString() : item.asString();
+}
+} // namespace
+
+Title GetTitle(const CFileItem& item)
+{
+  return GetTitle(item, std::string(ROOT) + "library/");
+}
+
+CVariant LoadIndexEntry(const Title& title)
+{
+  return LoadIndexEntry(title, ROOT);
+}
+
+std::set<std::string> ImportMovieFolder(const std::string& folder, const std::string& root)
+{
+  const std::string library = root + "library/";
+  if (!CURL(folder).GetProtocol().empty() || !CURL::IsFullPath(folder) ||
+      URIUtils::PathHasParent(URIUtils::GetRealPath(folder), library))
+    return {};
+
+  CFileItemList files;
+  // shortcut: import top-level movies with a matching NFO, extend for full folder indexing.
+  if (!XFILE::CDirectory::GetDirectory(folder, files, VIDEO_EXTENSIONS, XFILE::DIR_FLAG_DEFAULTS))
+    return {};
+
+  static std::mutex importMutex;
+  std::unique_lock lock(importMutex);
+  CFileItemList anchors;
+  if (XFILE::CDirectory::Exists(library))
+    CUtil::GetRecursiveListing(library, anchors, ".mkv");
+  std::map<std::string, std::string> anchorPaths;
+  for (const auto& anchor : anchors)
+  {
+    const auto title = GetTitle(*anchor, library);
+    if (!title.key.empty())
+      anchorPaths.emplace(title.key, title.path);
+  }
+
+  std::set<std::string> scanPaths;
+  for (const auto& file : files)
+  {
+    const std::string path = URIUtils::GetRealPath(file->GetPath());
+    if (file->m_bIsFolder || !IsLocalVideo(path, CURL(path)) ||
+        !GetTitle(*file, library).key.empty())
+      continue;
+
+    const std::string nfo = ReadState(URIUtils::ReplaceExtension(path, ".nfo"));
+    CXBMCTinyXML document;
+    CVideoInfoTag tag;
+    if (nfo.empty() || !document.Parse(nfo) || !document.RootElement() ||
+        !StringUtils::EqualsNoCase(document.RootElement()->ValueStr(), "movie") ||
+        !tag.Load(document.RootElement()) || tag.m_strTitle.empty() || tag.m_strTitle.size() > 255)
+      continue;
+
+    const std::string id = tag.GetUniqueID("tmdb");
+    if (id.empty() || id.size() > 20 || id.front() == '0' ||
+        id.find_first_not_of("0123456789") != std::string::npos)
+      continue;
+
+    const std::string key = "movie:tmdb:" + id;
+    const auto anchor = anchorPaths.emplace(key, library + "movies/movie-tmdb-" + id + ".mkv");
+    const Title title{anchor.first->second, key, {}};
+    CVariant entry = LoadIndexEntry(title, root);
+    if (entry["title"].asString().empty())
+      entry["title"] = tag.m_strTitle;
+    auto& local = entry["local"];
+    if (!local.isArray())
+      local = CVariant(CVariant::VariantTypeArray);
+    if (std::none_of(local.begin_array(), local.end_array(),
+                     [&](const CVariant& item) { return LocalPath(item) == path; }))
+      local.push_back(path);
+
+    std::string json;
+    if (!CJSONVariantWriter::Write(entry, json, true) || json.size() > MAX_RESPONSE ||
+        !WriteState(IndexPath(root, title), json))
+      continue;
+
+    const std::string anchorNfo = URIUtils::ReplaceExtension(title.path, ".nfo");
+    if ((!XFILE::CFile::Exists(anchorNfo) && !WriteState(anchorNfo, nfo)) ||
+        (!XFILE::CFile::Exists(title.path) && !WriteState(title.path, "")))
+      continue;
+    scanPaths.insert(URIUtils::GetDirectory(title.path));
+  }
+  return scanPaths;
 }
 
 Profile GetQualityProfile()
@@ -1028,7 +1140,7 @@ std::vector<FileCandidate> LocalFiles(const CVariant& entry, const Title& title)
     return files;
   for (auto it = local.begin_array(); it != local.end_array(); ++it)
   {
-    const std::string path = it->isObject() ? (*it)["path"].asString() : it->asString();
+    const std::string path = LocalPath(*it);
     const CURL url(path);
     if (!IsLocalVideo(path, url))
       continue;

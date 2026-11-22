@@ -559,6 +559,11 @@
         </setting>
       </group>
       <group id="4" label="42000">
+        <setting id="appliance.localonly" type="boolean">
+          <level>4</level>
+          <default>false</default>
+          <control type="toggle" />
+        </setting>
         <setting id="appliance.quality" type="string" label="42001" help="42017">
           <level>0</level>
           <default>balanced</default>

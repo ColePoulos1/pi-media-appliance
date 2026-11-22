@@ -49,6 +49,7 @@
 #include "utils/StringUtils.h"
 #include "utils/URIUtils.h"
 #include "utils/Variant.h"
+#include "video/AppliancePlayback.h"
 #include "video/VideoDbUrl.h"
 #include "video/VideoInfoScanner.h"
 #include "video/VideoInfoTag.h"
@@ -527,7 +528,10 @@ void CGUIDialogVideoInfo::Update()
   }
 
   // Check for resumability
-  if (m_movieItem->GetVideoInfoTag()->GetResumePoint().IsPartWay())
+  const bool resumable = m_movieItem->GetVideoInfoTag()->GetResumePoint().IsPartWay();
+  m_movieItem->SetProperty("ApplianceResume",
+                           resumable && !KODI::APPLIANCE::GetTitle(*m_movieItem).key.empty());
+  if (resumable)
     CONTROL_ENABLE(CONTROL_BTN_RESUME);
   else
     CONTROL_DISABLE(CONTROL_BTN_RESUME);
@@ -816,7 +820,7 @@ void CGUIDialogVideoInfo::Play(bool resume)
   // play the current video version, even if multiple versions are available
   m_movieItem->SetProperty("has_resolved_video_asset", true);
 
-  if (resume)
+  if (resume || m_movieItem->GetProperty("ApplianceResume").asBoolean())
   {
     CVideoPlayActionProcessor proc{m_movieItem};
     proc.ProcessAction(VIDEO::GUILIB::ACTION_RESUME);

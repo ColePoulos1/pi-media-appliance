@@ -192,6 +192,21 @@ class Kodi(KodiConnection):
     def window(self):
         return self.call("GUI.GetProperties", properties=["currentwindow"])["currentwindow"]["id"]
 
+    def focused(self, control):
+        field = f"Control.HasFocus({control})"
+        return self.call("XBMC.GetInfoBooleans", booleans=[field])[field]
+
+    def label(self, field="ListItem.Label"):
+        return self.call("XBMC.GetInfoLabels", labels=[field])[field]
+
+    def navigate(self, direction, check):
+        for _ in range(24):
+            if check():
+                return
+            self.call("Input." + direction)
+            sleep(0.1)
+        raise AssertionError(f"Could not reach control in window {self.window()}, label={self.label()!r}")
+
     def start(self):
         return self.wait_for("Player.OnAVStart")["player"]["playerid"]
 
@@ -664,12 +679,15 @@ def library_check(userdata, port, phase):
             condition = f"Control.HasFocus({control})"
             return kodi.call("XBMC.GetInfoBooleans", booleans=[condition])[condition]
 
-        def open_home_section(section):
+        def open_home_control(control):
             kodi.call("Input.Home")
             kodi.wait_until(lambda: kodi.window() == 10000)
-            focus(lambda: control_focused(9000), "Left")
-            field = "Container(9000).ListItem.Property(id)"
-            focus(lambda: kodi.call("XBMC.GetInfoLabels", labels=[field])[field] == section, "Down")
+            if kodi.focused(10):
+                kodi.call("Input.Select")
+                kodi.wait_until(lambda: kodi.focused(11))
+            if kodi.focused(20):
+                kodi.call("Input.Left")
+            kodi.navigate("Down", lambda: kodi.focused(control))
 
         def bookmark(anchor):
             with sqlite3.connect(database) as db:
@@ -725,7 +743,7 @@ def library_check(userdata, port, phase):
                 kodi.seek(player, seek_to)
                 player = kodi.try_another()
                 kodi.tracks(player, "jpn", 320, "eng")
-                assert abs(kodi.position(player) - seek_to) <= 2
+                kodi.wait_until(lambda: abs(kodi.position(player) - seek_to) <= 1)
                 kodi.stop(player)
                 kodi.wait_until(lambda: abs(bookmark(anchor) - seek_to) <= 2)
                 assert kodi.call("Favourites.AddFavourite", type="media", title=title,
@@ -743,25 +761,148 @@ def library_check(userdata, port, phase):
                 if route == "detail":
                     detail()
                 elif route == "favorite":
-                    open_home_section("favorites")
+                    open_home_control(12)
                     kodi.call("Input.Select")
                     kodi.wait_until(lambda: kodi.window() == 10060)
                     focus(lambda: label() == title, "Right")
                     kodi.request("Input.Select")
                 else:
-                    open_home_section("movies" if kind == "movie" else "tvshows")
-                    kodi.call("Input.Right")
-                    focus(lambda: control_focused(5100 if kind == "movie" else 6100), "Down")
-                    if kind == "episode":
-                        kodi.call("Input.Select")
-                        kodi.wait_until(lambda: kodi.window() == 10025)
-                        focus(lambda: label() == "Season 1" or video_title() == title, "Down")
-                        if video_title() != title:
-                            kodi.call("Input.Select")
-                    focus(lambda: video_title() == title, "Down")
+                    open_home_control(13)
+                    kodi.call("Input.Select")
+                    kodi.wait_until(lambda: kodi.focused(20))
+                    kodi.navigate("Down", lambda: kodi.label("Container(20).ListItem.Title") == title)
+                    kodi.call("Input.Select")
+                    kodi.wait_until(lambda: kodi.window() == 12003)
                     kodi.request("Input.Select")
                 check_resume(anchor, saved, seek_to)
                 print(f"{kind}: Estuary {route} resumed the saved source, tracks and {saved:.1f}s bookmark")
+
+
+def home_check(userdata, port, phase):
+    root = userdata / "appliance"
+    folder = Path.home() / "M4 Fixture Movies"
+    media = folder / "A Fixture Movie.mkv"
+    title = media.stem
+    if phase == "first":
+        assert not root.exists(), root
+        folder.mkdir()
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                        "-i", "color=red:size=160x90:rate=10", "-t", "40", "-c:v", "mpeg4",
+                        "-g", "10", str(media)], check=True)
+        media.with_suffix(".nfo").write_text(
+            f'<movie><title>{title}</title><uniqueid type="tmdb" default="true">'
+            '900000004</uniqueid></movie>', encoding="utf-8")
+
+    with (ThreadingHTTPServer(("127.0.0.1", 0), Provider) as provider,
+          socket.create_connection(("127.0.0.1", port), timeout=10) as connection):
+        provider.calls = Counter()
+        Thread(target=provider.serve_forever, daemon=True).start()
+        kodi = Kodi(connection)
+        anchor = root / "library" / "movies" / "movie-tmdb-900000004.mkv"
+        row = root / "index" / "movie-tmdb-900000004.json"
+
+        def press(control=None, window=None):
+            if control is not None:
+                kodi.wait_until(lambda: kodi.focused(control))
+            kodi.request("Input.Select")
+            if window is not None:
+                kodi.wait_until(lambda: kodi.window() == window)
+
+        def movies():
+            return kodi.call("VideoLibrary.GetMovies", properties=["file", "uniqueid", "resume"]).get(
+                "movies", [])
+
+        def result_focused():
+            return kodi.focused(20) and kodi.label("Container(20).ListItem.Label") == title
+
+        def add_folder():
+            kodi.navigate("Down", lambda: kodi.focused(14))
+            press(14, 12000)
+            assert kodi.label() == "Media folders"
+            press()
+            kodi.wait_until(lambda: kodi.label() == "Add folder")
+            press(window=10126)
+            kodi.navigate("Down", lambda: kodi.label() == "Home folder")
+            press()
+            kodi.navigate("Down", lambda: kodi.label() == folder.name)
+            press()
+            kodi.wait_until(lambda: str(folder) in kodi.label("Control.GetLabel(412)"))
+            kodi.call("Input.Left")
+            press(413)
+            kodi.wait_for("VideoLibrary.OnScanFinished", 20)
+
+        try:
+            kodi.wait_until(lambda: kodi.window() == 10000)
+            if phase == "first":
+                press(10, 10000)
+                kodi.navigate("Down", lambda: kodi.focused(13))
+                press(13, 10000)
+                kodi.wait_until(lambda: kodi.label("Window.Property(ApplianceEmpty)"))
+                kodi.call("Input.Back")
+                kodi.wait_until(lambda: not kodi.label("Window.Property(ApplianceEmpty)"))
+            else:
+                kodi.wait_until(lambda: kodi.focused(11))
+                saved, = movies()
+
+            add_folder()
+            movie, = movies()
+            assert movie["file"] == str(anchor) and movie["uniqueid"]["tmdb"] == "900000004", movie
+            assert anchor.stat().st_size == 0 and anchor.with_suffix(".nfo").is_file()
+            entry = json.loads(row.read_text(encoding="utf-8"))
+            assert entry["local"] == [str(media)], entry
+            # Give discovery a valid route so removing the media tests the local-only gate.
+            write_json(root / "providers.json", {"fixture": f"http://127.0.0.1:{provider.server_port}"})
+            write_json(row, dict(entry, query="Pilot Show"))
+
+            if phase == "first":
+                kodi.navigate("Down", lambda: kodi.focused(11))
+                press(11, 10103)
+                kodi.call("Input.Right")
+                assert kodi.label("Control.GetLabel(140)").lower() == "a"
+                press(140)
+                kodi.navigate("Right", lambda: kodi.focused(300))
+                press(300, 10000)
+                kodi.wait_until(result_focused)
+                press(20, 12003)
+                kodi.call("Input.Back")
+                kodi.wait_until(lambda: kodi.window() == 10000 and kodi.focused(20))
+                press(20, 12003)
+                press(8)
+                player = kodi.start()
+                assert kodi.width(player) == 160
+                kodi.seek(player, 15)
+                kodi.stop(player)
+                kodi.wait_until(lambda: abs(movies()[0]["resume"]["position"] - 15) <= 2)
+            else:
+                assert movie["movieid"] == saved["movieid"] and movie["resume"] == saved["resume"]
+                kodi.navigate("Down", lambda: kodi.focused(13))
+                press(13, 10000)
+                kodi.wait_until(result_focused)
+                press(20, 12003)
+                press(8)
+                player = kodi.start()
+                assert abs(kodi.position(player) - saved["resume"]["position"]) <= 2
+                kodi.stop(player)
+
+                missing = media.with_suffix(".missing")
+                media.rename(missing)
+                try:
+                    kodi.call("Player.Open", item={"movieid": movie["movieid"]})
+                    kodi.wait_until(lambda: kodi.window() == 12000)
+                    assert "Retry" in kodi.label()
+                    kodi.call("Input.Select")
+                    sleep(0.6)
+                    kodi.wait_until(lambda: kodi.window() == 12000)
+                    assert not provider.calls, provider.calls
+                    kodi.call("Input.Back")
+                    kodi.wait_until(lambda: kodi.window() != 12000)
+                finally:
+                    missing.rename(media)
+                kodi.stop(kodi.play(media))
+            assert not provider.calls, provider.calls
+            print(f"Home {phase}: indexed movie, title detail and bookmark, zero provider requests")
+        finally:
+            provider.shutdown()
 
 
 def play_to_frame(kodi, path, channel, resume=False):
@@ -991,6 +1132,7 @@ if __name__ == "__main__":
     parser.add_argument("--language-phase", choices=["first", "restart", "second-profile"])
     parser.add_argument("--recovery-phase", choices=["first", "restart"])
     parser.add_argument("--library-phase", choices=["first", "restart"])
+    parser.add_argument("--home-phase", choices=["first", "restart"])
     parser.add_argument("--measure-frames", action="store_true",
                         help="sample first visible frames on a 1280x720x24 Linux Xvfb display")
     args = parser.parse_args()
@@ -1001,5 +1143,7 @@ if __name__ == "__main__":
         recovery_check(userdata, args.port, args.recovery_phase)
     elif args.library_phase:
         library_check(userdata, args.port, args.library_phase)
+    elif args.home_phase:
+        home_check(userdata, args.port, args.home_phase)
     else:
         run(userdata, args.port, args.measure_frames)

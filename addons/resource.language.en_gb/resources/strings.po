@@ -23941,6 +23941,42 @@ msgctxt "#42023"
 msgid "Retry"
 msgstr ""
 
+msgctxt "#42024"
+msgid "Use local media"
+msgstr ""
+
+msgctxt "#42025"
+msgid "Continue Watching"
+msgstr ""
+
+msgctxt "#42026"
+msgid "Media folders"
+msgstr ""
+
+msgctxt "#42027"
+msgid "Add folder"
+msgstr ""
+
+msgctxt "#42028"
+msgid "No matching titles. Add a media folder in Settings."
+msgstr ""
+
+msgctxt "#42029"
+msgid "Partially watched titles will appear here."
+msgstr ""
+
+msgctxt "#42030"
+msgid "Looking for movies in the selected folder…"
+msgstr ""
+
+msgctxt "#42031"
+msgid "No movies could be added. Each movie needs an NFO with a TMDB ID."
+msgstr ""
+
+msgctxt "#42032"
+msgid "Changes could not be saved. Try again."
+msgstr ""
+
 #. Generic video versions label (plural)
 #: xbmc/filesystem/VideoDatabaseDirectory.cpp
 #: xbmc/filesystem/VideoDatabaseDirectory/DirectoryNodeMoviesOverview.cpp

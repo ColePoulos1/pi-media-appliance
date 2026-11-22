@@ -250,6 +250,7 @@ bool HasKnownLanguage(const std::vector<RankedFile>& files,
 
 Title GetTitle(const CFileItem& item);
 CVariant LoadIndexEntry(const Title& title);
+std::set<std::string> ImportMovieFolder(const std::string& folder, const std::string& root);
 Profile GetQualityProfile();
 PlaybackLanguage GetPlaybackLanguage(const Title& title,
                                      const CFileItem& item,
