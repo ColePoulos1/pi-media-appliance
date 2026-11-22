@@ -71,6 +71,8 @@ constexpr char ROOT[] = "special://profile/appliance/";
 constexpr char TORBOX[] = "https://api.torbox.app";
 constexpr char TORBOX_TORRENTS[] = "/v1/api/torrents/";
 constexpr char TORBOX_PROVIDER[] = "torbox";
+constexpr char TORBOX_CACHE_ROUTE[] = "torbox-cache";
+constexpr char BITSEARCH[] = "https://bitsearch.eu";
 constexpr char TORBOX_VERIFICATION[] = "https://tor.box/link";
 constexpr char VIDEO_EXTENSIONS[] = ".mkv|.mp4|.m4v|.avi|.webm|.mov|.ts|.m2ts";
 constexpr size_t MAX_RESPONSE = 2 * 1024 * 1024;
@@ -234,7 +236,8 @@ CVariant GetJson(const std::string& url,
                  const std::atomic_bool& cancelled,
                  const std::string& header = {},
                  const std::string& post = {},
-                 long* status = nullptr)
+                 long* status = nullptr,
+                 const char* contentType = nullptr)
 {
   if (cancelled || !IsHttp(CURL(url)) || header.find_first_of("\r\n") != std::string::npos)
     return {};
@@ -244,9 +247,19 @@ CVariant GetJson(const std::string& url,
   std::unique_ptr<curl_slist, decltype(freeHeaders)> headers(
       header.empty() ? nullptr : g_curlInterface.slist_append(nullptr, header.c_str()),
       freeHeaders);
+  if (!header.empty() && !headers)
+    return {};
+  if (contentType)
+  {
+    auto* list = g_curlInterface.slist_append(headers.get(), contentType);
+    if (!list)
+      return {};
+    headers.release();
+    headers.reset(list);
+  }
   const auto cleanup = [](CURL_HANDLE* curl) { g_curlInterface.easy_cleanup(curl); };
   std::unique_ptr<CURL_HANDLE, decltype(cleanup)> curl(g_curlInterface.easy_init(), cleanup);
-  if (!curl || (!header.empty() && !headers))
+  if (!curl)
     return {};
 
   std::string response;
@@ -349,7 +362,18 @@ bool MatchesFile(const CVariant& file, const CVariant& entry)
     stem.resize(suffix);
 
   if (episode.empty())
-    return stem == title;
+  {
+    static const std::regex parenthesizedYear(R"( \(([0-9]{4})\)$)");
+    static const std::regex year(R"( [0-9]{4}$)");
+    const auto normalizeYear = [&](const std::string& value)
+    { return std::regex_replace(value, parenthesizedYear, " $1"); };
+    const std::string movie = normalizeYear(title);
+    const std::string query = normalizeYear(Words(entry["query"].asString()));
+    const bool queryAddsYear = query.size() == movie.size() + 5 &&
+                               query.compare(0, movie.size(), movie) == 0 &&
+                               std::regex_search(query, year);
+    return normalizeYear(stem) == (queryAddsYear ? query : movie);
+  }
 
   static const std::regex episodeNumber("s[0-9]{2}e[0-9]{2,3}");
   if (!std::regex_match(episode, episodeNumber))
@@ -1907,79 +1931,158 @@ CVariant SelectFile(const CVariant& files, const CVariant& entry)
   return selected;
 }
 
+namespace
+{
+std::string MemberPath(const CVariant& file)
+{
+  std::string name = file["name"].asString();
+  StringUtils::Replace(name, '\\', '/');
+  return name;
+}
+
+bool TorrentReady(const CVariant& torrent)
+{
+  return ReadId(torrent["id"]) >= 0 && torrent["download_finished"].asBoolean() &&
+         torrent["download_present"].asBoolean();
+}
+
+std::string PlaybackFixture(const CVariant& providers)
+{
+  const std::string base = providers["fixture"].asString();
+  const CURL url(base);
+  return url.IsProtocol("http") && url.GetHostName() == "127.0.0.1" && IsHttp(url) ? base : "";
+}
+
+int64_t AcquireCached(const std::string& base,
+                      const std::string& auth,
+                      const FileIdentity& identity,
+                      const std::atomic_bool& cancelled)
+{
+  const auto findAccountTorrent = [&]() -> std::pair<bool, int64_t>
+  {
+    constexpr unsigned int pageSize = 200;
+    for (unsigned int offset = 0; !cancelled; offset += pageSize)
+    {
+      const CVariant listing =
+          GetJson(base + "mylist?bypass_cache=true&files=false&limit=" +
+                      std::to_string(pageSize) + "&offset=" + std::to_string(offset),
+                  cancelled, auth);
+      const CVariant& torrents = listing["data"];
+      if (!listing["success"].asBoolean() || !torrents.isArray())
+        break;
+      for (auto it = torrents.begin_array(); it != torrents.end_array(); ++it)
+      {
+        if (NormalizeInfoHash((*it)["hash"].asString()) == identity.torrentHash)
+          return {true, ReadId((*it)["id"])};
+      }
+      if (torrents.size() < pageSize)
+        return {false, -1};
+    }
+    // A failed lookup cannot establish that the account needs a new torrent.
+    return {true, -1};
+  };
+
+  const auto [found, existing] = findAccountTorrent();
+  if (found)
+    return existing;
+
+  constexpr char contentType[] = "Content-Type: multipart/form-data; boundary=KodiAppliance";
+  const std::string post =
+      "--KodiAppliance\r\nContent-Disposition: form-data; name=\"magnet\"\r\n\r\n"
+      "magnet:?xt=urn:btih:" +
+      identity.torrentHash +
+      "\r\n--KodiAppliance\r\nContent-Disposition: form-data; name=\"add_only_if_cached\"\r\n\r\n"
+      "true\r\n--KodiAppliance--\r\n";
+  const CVariant added = GetJson(base + "createtorrent", cancelled, auth, post, nullptr, contentType);
+  const CVariant& data = added["data"];
+  if (added["success"].asBoolean() &&
+      NormalizeInfoHash(data["hash"].asString()) == identity.torrentHash &&
+      ReadId(data["torrent_id"]) >= 0)
+    return ReadId(data["torrent_id"]);
+
+  // The server may have accepted the POST before the client lost the reply.
+  return findAccountTorrent().second;
+}
+} // namespace
+
 std::vector<FileCandidate> Discover(const CVariant& entry,
                                     const CVariant& providers,
                                     const std::string& titleKey,
                                     const std::atomic_bool& cancelled)
 {
-  const std::string fixture = providers["fixture"].asString();
+  const std::string fixture = PlaybackFixture(providers);
   const std::string query = entry["query"].asString();
   if (query.empty())
     return {};
 
-  const std::string prowlarr = fixture.empty() ? providers["prowlarr"].asString() : fixture;
+  const bool cacheFixture = !fixture.empty() && providers["cacheFixture"].asBoolean();
+  const std::string prowlarr =
+      !fixture.empty() && !cacheFixture ? fixture : providers["prowlarr"].asString();
   const std::string apiKey = providers["prowlarrKey"].asString();
   const std::string torboxKey = providers["torboxKey"].asString();
-  if (prowlarr.empty() || (fixture.empty() && (apiKey.empty() || torboxKey.empty())))
-    return {};
-
-  const CVariant releases =
-      GetJson(prowlarr + "/api/v1/search?type=search&limit=" + std::to_string(RELEASE_LIMIT) +
-                  "&query=" + CURL::Encode(query),
-              cancelled, fixture.empty() ? "X-Api-Key: " + apiKey : std::string{});
-  if (!releases.isArray())
+  if (fixture.empty() && !TokenValid(torboxKey))
     return {};
 
   std::map<std::string, std::vector<FileEvidence>> releaseEvidence;
-  for (unsigned int i = 0; i < std::min(releases.size(), RELEASE_LIMIT); ++i)
+  const auto addReleases = [&](const CVariant& releases, bool bitsearch)
   {
-    const auto& release = releases[i];
-    const auto hash = InfoHash(release);
-    if (hash.empty())
-      continue;
-    FileEvidence evidence = NameEvidence(release["title"].asString(), true);
-    evidence.reportedBy = "prowlarr";
-    evidence.size = FileSize::FromMemberBytes(release["size"]);
-    if (evidence.size.bytes)
-      evidence.size.kind = SizeKind::PackTotal;
-    releaseEvidence[hash].push_back(std::move(evidence));
+    if (!releases.isArray())
+      return;
+    for (unsigned int i = 0; i < std::min(releases.size(), RELEASE_LIMIT); ++i)
+    {
+      const auto& release = releases[i];
+      const auto hash =
+          bitsearch ? NormalizeInfoHash(release["infohash"].asString()) : InfoHash(release);
+      if (hash.empty())
+        continue;
+      FileEvidence evidence = NameEvidence(release["title"].asString(), true);
+      evidence.reportedBy = bitsearch ? "bitsearch" : "prowlarr";
+      evidence.size = FileSize::FromMemberBytes(release["size"]);
+      if (evidence.size.bytes)
+        evidence.size.kind = SizeKind::PackTotal;
+      releaseEvidence[hash].push_back(std::move(evidence));
+    }
+  };
+  if (cacheFixture || (fixture.empty() && CEnvironment::getenv("APPLIANCE_BITSEARCH_EVALUATION") == "1"))
+  {
+    const auto search = [&](const std::string& terms)
+    {
+      return GetJson((cacheFixture ? fixture : BITSEARCH) + "/api/v1/search?limit=" +
+                         std::to_string(RELEASE_LIMIT) + "&q=" + CURL::Encode(terms),
+                     cancelled);
+    };
+    const std::string episode = entry["episode"].asString();
+    const CVariant standalone = search(episode.empty() ? query : query + " " + episode);
+    if (standalone["success"].asBoolean())
+      addReleases(standalone["results"], true);
+    if (!episode.empty())
+    {
+      const CVariant season = search(query + " " + episode.substr(0, 3));
+      if (season["success"].asBoolean())
+        addReleases(season["results"], true);
+    }
   }
+  if (!prowlarr.empty() && ((!fixture.empty() && !cacheFixture) || !apiKey.empty()))
+    addReleases(GetJson(prowlarr + "/api/v1/search?type=search&limit=" +
+                            std::to_string(RELEASE_LIMIT) + "&query=" + CURL::Encode(query),
+                        cancelled, apiKey.empty() ? "" : "X-Api-Key: " + apiKey),
+                false);
   if (releaseEvidence.empty())
     return {};
 
-  // shortcut: only use ready torrents already in the pilot account until cached acquisition is implemented.
-  const CVariant listing =
-      GetJson((fixture.empty() ? TORBOX : fixture) + std::string(TORBOX_TORRENTS) +
-                  "mylist?limit=" + std::to_string(TORRENT_LIMIT),
-              cancelled, fixture.empty() ? "Authorization: Bearer " + torboxKey : std::string{});
-  const CVariant& torrents = listing["data"];
-  if (!listing["success"].asBoolean() || !torrents.isArray())
-    return {};
-
+  const std::string base = (fixture.empty() ? TORBOX : fixture) + std::string(TORBOX_TORRENTS);
+  const std::string auth = fixture.empty() ? "Authorization: Bearer " + torboxKey : "";
   std::vector<FileCandidate> candidates;
-  for (unsigned int i = 0; i < std::min(torrents.size(), TORRENT_LIMIT); ++i)
+  const auto addCandidate = [&](const std::string& hash, const CVariant& selected, int64_t torrentId)
   {
-    const auto& torrent = torrents[i];
-    const int64_t torrentId = ReadId(torrent["id"]);
-    const std::string hash = NormalizeInfoHash(torrent["hash"].asString());
-    const auto release = releaseEvidence.find(hash);
-    if (torrentId < 0 || release == releaseEvidence.end() ||
-        !torrent["download_finished"].asBoolean() || !torrent["download_present"].asBoolean())
-      continue;
-
-    const CVariant selected = SelectFile(torrent["files"], entry);
-    if (selected.isNull())
-      continue;
-
-    std::string member = selected["name"].asString();
-    StringUtils::Replace(member, '\\', '/');
+    std::string member = MemberPath(selected);
     FileEvidence file = NameEvidence(URIUtils::GetFileName(member), true);
     file.reportedBy = TORBOX_PROVIDER;
     file.titleKey = titleKey;
     file.size = FileSize::FromMemberBytes(selected["size"]);
     file.availability = Availability::Available;
 
-    auto evidence = release->second;
+    auto evidence = releaseEvidence.at(hash);
     for (auto& report : evidence)
     {
       if (file.resolution)
@@ -1992,31 +2095,117 @@ std::vector<FileCandidate> Discover(const CVariant& entry,
         report.hdr.clear();
     }
     evidence.push_back(std::move(file));
-    candidates.push_back(
-        {{Tier::Remote, hash, std::move(member)},
-         {{TORBOX_PROVIDER, std::to_string(torrentId), std::to_string(ReadId(selected["id"]))}},
-         std::move(evidence)});
+    ResolverRoute route = torrentId >= 0
+                              ? ResolverRoute{TORBOX_PROVIDER, std::to_string(torrentId),
+                                              std::to_string(ReadId(selected["id"]))}
+                              : ResolverRoute{TORBOX_CACHE_ROUTE, hash, member};
+    candidates.push_back({{Tier::Remote, hash, std::move(member)},
+                          {std::move(route)}, std::move(evidence)});
+  };
+
+  const CVariant listing =
+      GetJson(base + "mylist?limit=" + std::to_string(TORRENT_LIMIT), cancelled, auth);
+  const CVariant& torrents = listing["data"];
+  std::set<std::string> inAccount;
+  if (listing["success"].asBoolean() && torrents.isArray())
+  {
+    for (unsigned int i = 0; i < std::min(torrents.size(), TORRENT_LIMIT); ++i)
+    {
+      const auto& torrent = torrents[i];
+      const std::string hash = NormalizeInfoHash(torrent["hash"].asString());
+      if (!releaseEvidence.count(hash))
+        continue;
+      inAccount.insert(hash);
+      if (!TorrentReady(torrent))
+        continue;
+      const CVariant selected = SelectFile(torrent["files"], entry);
+      if (!selected.isNull())
+        addCandidate(hash, selected, ReadId(torrent["id"]));
+    }
+  }
+
+  if (cacheFixture || fixture.empty())
+  {
+    const auto checkCached = [&](const std::string& hashes)
+    {
+      const CVariant reply = GetJson(base + "checkcached?format=object&list_files=true" + hashes,
+                                     cancelled, auth);
+      if (!reply["success"].asBoolean() || !reply["data"].isObject())
+        return;
+      for (auto it = reply["data"].begin_map(); it != reply["data"].end_map(); ++it)
+      {
+        const std::string hash = NormalizeInfoHash(it->first);
+        if (!releaseEvidence.count(hash) || inAccount.count(hash))
+          continue;
+        const CVariant selected = SelectFile(it->second["files"], entry);
+        if (!selected.isNull())
+          addCandidate(hash, selected, -1);
+      }
+    };
+    // Bound each cache reply independently of the number of discovery sources.
+    unsigned int count = 0;
+    std::string hashes;
+    for (const auto& [hash, evidence] : releaseEvidence)
+    {
+      if (inAccount.count(hash))
+        continue;
+      hashes += "&hash=" + hash;
+      if (++count % RELEASE_LIMIT == 0)
+      {
+        checkCached(hashes);
+        hashes.clear();
+      }
+    }
+    if (!hashes.empty())
+      checkCached(hashes);
   }
   return candidates;
 }
 
 std::string Resolve(const CVariant& providers,
                     const ResolverRoute& route,
+                    const FileIdentity& identity,
+                    const CVariant& entry,
                     const std::atomic_bool& cancelled)
 {
-  if (route.provider != TORBOX_PROVIDER || route.torrentId.empty() || route.fileId.empty())
+  if (route.torrentId.empty() || route.fileId.empty())
     return {};
 
-  const std::string fixture = providers["fixture"].asString();
+  const std::string fixture = PlaybackFixture(providers);
   const std::string key = providers["torboxKey"].asString();
-  if (fixture.empty() && key.empty())
+  if (fixture.empty() && !TokenValid(key))
     return {};
 
-  const CVariant response = GetJson(
-      (fixture.empty() ? TORBOX : fixture) + std::string(TORBOX_TORRENTS) + "requestdl?" +
-      (fixture.empty() ? "token=" + CURL::Encode(key) + "&" : std::string{}) +
-      "torrent_id=" + CURL::Encode(route.torrentId) + "&file_id=" + CURL::Encode(route.fileId),
-      cancelled);
+  const std::string base = (fixture.empty() ? TORBOX : fixture) + std::string(TORBOX_TORRENTS);
+  std::string torrentId = route.torrentId;
+  std::string fileId = route.fileId;
+  if (route.provider == TORBOX_CACHE_ROUTE)
+  {
+    if (NormalizeInfoHash(identity.torrentHash).empty() || identity.torrentHash != torrentId ||
+        identity.member != fileId)
+      return {};
+    const std::string auth = fixture.empty() ? "Authorization: Bearer " + key : "";
+    const int64_t acquired = AcquireCached(base, auth, identity, cancelled);
+    if (acquired < 0)
+      return {};
+    torrentId = std::to_string(acquired);
+    const CVariant reply = GetJson(base + "mylist?bypass_cache=true&id=" + torrentId, cancelled, auth);
+    const CVariant& torrent = reply["data"];
+    if (!reply["success"].asBoolean() || !TorrentReady(torrent) || ReadId(torrent["id"]) != acquired ||
+        NormalizeInfoHash(torrent["hash"].asString()) != identity.torrentHash)
+      return {};
+    const CVariant selected = SelectFile(torrent["files"], entry);
+    if (MemberPath(selected) != identity.member)
+      return {};
+    fileId = std::to_string(ReadId(selected["id"]));
+  }
+  else if (route.provider != TORBOX_PROVIDER)
+    return {};
+
+  const CVariant response =
+      GetJson(base + "requestdl?" + (fixture.empty() ? "token=" + CURL::Encode(key) + "&" : "") +
+                  "torrent_id=" + CURL::Encode(torrentId) + "&file_id=" + CURL::Encode(fileId),
+              cancelled);
   if (!response["success"].asBoolean())
     return {};
 

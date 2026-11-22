@@ -2621,11 +2621,12 @@ void CApplication::TryApplianceSource()
     attempt->lookup = lookup;
     attempt->lookupUntil = std::min(attempt->budget.deadline, now + RETRY_TIME);
     CServiceBroker::GetJobManager()->Submit(
-        [providers = attempt->providers, lookup, route, token]()
+        [providers = attempt->providers, entry = attempt->entry, identity = file.identity, lookup,
+         route, token]()
         {
           if (*lookup)
             return;
-          const std::string path = Resolve(providers, route, *lookup);
+          const std::string path = Resolve(providers, route, identity, entry, *lookup);
           if (*lookup)
             return;
           CGUIMessage message(GUI_MSG_APPLIANCE_SOURCE_READY, 0, 0, token);

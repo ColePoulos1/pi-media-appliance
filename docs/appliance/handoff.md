@@ -33,9 +33,9 @@ The legacy index and seeded library scenarios passed. The baseline exercised loc
 
 The [provider evaluation](m4-provider-evaluation.md) records the four candidates, public endpoint checks and operator and credential constraints. BitSearch is the first candidate for matched coverage testing because its direct API offers keyless access. The next open question is how many of the owner's Fen-playable movies and episodes an eligible candidate can play and whether its operator permits the shipped use. Compare both setups on the agreed private sample using the same TorBox account, with the owner's server unavailable to the appliance and Prowlarr unconfigured on it.
 
-**22 November 2026 · Coverage target and starting sample supplied.** The owner wants approximately 90% coverage of Fen-playable titles, measured separately for movies and episodes. Extremely niche, extremely old and foreign titles other than anime are lower priority. The private starting sample and permission to add cases are recorded in `C:/Code/artifacts/pi-media-provider-sample.txt`, outside Git. Verify the supplied anime case's catalog identity and add enough cases to make the comparison meaningful. The provider comparison and operator permission remain open.
+**22 November 2026 · Coverage target and starting sample supplied.** The owner wants approximately 90% coverage of Fen-playable titles, measured separately for movies and episodes. Extremely niche, extremely old and foreign titles other than anime are lower priority. The private starting sample and permission to add cases are recorded in `C:/Code/artifacts/pi-media-provider-sample.txt`, outside Git. The owner confirmed the anime episode match and opted in to BitSearch for the evaluation. The matched comparison and operator permission for shipping a default remain open.
 
-The fork stays public. The owner supplied a TMDB API key from a dedicated disposable account with no other services linked. The workstation stores it as `TMDB_API_KEY` in the Git-ignored root `.env`. Confirmation that the registration covers the intended distribution, confirmation of the bundled read-token model, and fresh-image catalog lookup are pending. The evaluation records the applicable attribution and cache terms.
+The fork stays public. The owner supplied a TMDB API key from a dedicated disposable account with no other services linked and confirmed it may be distributed in the private friends image. The workstation stores the development key as `TMDB_API_KEY` in the Git-ignored root `.env`. Private packaging with the application read token, fresh-image catalog lookup, attribution and the cache lifecycle remain open.
 
 ### M4 point 4 desktop acceptance
 
@@ -71,6 +71,51 @@ All 15 focused GTests passed. The account fixture covered pending and expired au
 The prior baseline playback and seeded movie and episode library assertions also passed. Two desktop runs reported a process abort after their assertions when the harness terminated Kodi with SIGTERM, including one allocator error. The SMB fixture repeated with `Application.Quit` and exited cleanly. Pi shutdown behavior and the cause of the desktop termination issue remain unverified.
 
 The next physical run still needs the LibreELEC wizard handoff, Ethernet, Wi-Fi, physical CEC input, live TorBox phone authorization, and real HDMI capability observations. Official Kodi Remote discovery, text entry and authenticated control from a separate LAN client remain point 6 acceptance. The HTTP pairing setup uses Kodi's existing transport settings. Default-provider selection and the household comparison remain open. Point 5 release discovery and cache acquisition were outside this checkpoint.
+
+### M4 points 5 and 6 desktop evidence
+
+**22 November 2026.** Tested appliance tree `7f5d1b7bad721d58dbb1c8bfda374243c2776f9b` based on `3ff4c15cc32a15c4fad5a3c0bd0951e08b139bc8` on the [documented X11 environment](#m4-point-1-desktop-evidence). The BitSearch adapter is enabled for evaluation with `APPLIANCE_BITSEARCH_EVALUATION=1` in Kodi's process environment. It searches by movie or by series with standalone episode and season terms. BitSearch receives the catalog terms without TorBox credentials. Discovery merges hashes from optional Prowlarr. TorBox supplies ready account entries and cache member evidence. Kodi adds only a selected cached torrent, checks the account if the add reply is lost, and verifies the exact member again before requesting a link with the account's file ID. A year supplied by the movie catalog is checked when matching releases. Episode matching still requires the series, number and episode title from the file name. [BitSearch API](https://bitsearch.eu/api) · [TorBox torrent API](https://api-docs.torbox.app/)
+
+```sh
+cmake --build /appliance-build --target kodi-test kodi-x11 -j 7
+(cd /appliance-build && ./kodi-test --gtest_filter='TestAppliancePlayback.*:TestFile.Read')
+python3 -B -u docs/appliance/test_appliance_playback.py "$cache_userdata" --port 19126 --cached-discovery
+python3 -B -u docs/appliance/test_appliance_playback.py "$baseline_userdata" --port 19107 --measure-frames
+python3 -B -u docs/appliance/test_appliance_playback.py "$remote_userdata" --port 19124 \
+  --remote-settings --remote-host "$(hostname -i)"
+```
+
+The 15 focused tests passed. With Prowlarr absent and an empty loopback account, the movie played after a lost add response and one expired-link refresh. The episode advanced past a cache eviction to the correct pack member. Kodi made three cache-only POSTs in total, including the evicted release, and used the account file ID even when it differed from the cache file ID. A later run with optional Prowlarr kept the ready routes through a failed optional query and a duplicate release. Uncached and ambiguous cases ended without an add or link request. The prior baseline passed local-first, silent SMB fallback, exact member selection, resume, link refresh, alternate routes, Stop and cancellation.
+
+Home import and restart passed on port 19117, the seeded library first and restart phases passed on 19106, and the catalog fixture passed on 19121 using the same commands from the earlier desktop records. The exhaustion dialog still uses the general `No playable source found` message for an entirely uncached or unconfirmed result.
+
+The Official Kodi Remote source at `027c31ecfef92bd2d4e3aaf8521aae640bdd7884` discovers HTTP through Zeroconf and uses HTTP JSON-RPC for text and Now Playing requests. It separately looks up the raw TCP service for notifications. Kodi now advertises raw TCP only when it listens on LAN interfaces. The desktop fixture authenticated against the container's non-loopback IPv4 address, saw HTTP 401 for missing and incorrect credentials, and verified rotation and revocation. Raw TCP refused connections to that address before, during and after pairing. The fixture ran from the same container. Discovery, keyboard and player behavior on the phone and tests from a separate LAN client remain open. [Official Kodi Remote source](https://github.com/xbmc/Official-Kodi-Remote-iOS/tree/027c31ecfef92bd2d4e3aaf8521aae640bdd7884)
+
+A BitSearch workstation query for a public Linux distribution returned two results with validly shaped hashes. The private TMDB sample lookup returned one candidate series and episode for the anime case. The owner confirmed the match. The IDs are saved outside Git in `C:/Code/artifacts/pi-media-provider-sample-anime-catalog.json`. The next discovery check is the matched Fen comparison, including whether catalog and provider naming supplies enough evidence to confirm the correct episode. The evaluation switch remains explicit while provider permission and coverage are open.
+
+### M4 Pi 5 test build
+
+The hardware-test build uses the desktop tree above and LibreELEC `6209f5a3b067c45fbf527286dd84ee483294b46a`. Kodi source archive `kodi-21.3-Omega-m4-7f5d1b7.tar.gz` has SHA-256 `d5790872e1d745ef4e98918284b5e045f129ad089969843905afcd98bd2b9d83`. The archive uses the `xbmc-21.3-Omega/` prefix and LF normalization for the Windows-exported source. The LibreELEC recipe uses the loopback archive and the [network overlay](libreelec-settings-network.patch) in the pinned settings add-on's patches directory. The build ran as `builder` in `pi-media-pi5-build` from `/home/builder/LibreELEC` with the loopback archive server listening at port 19753.
+
+```sh
+export PATH="/usr/lib/go-1.23/bin:$PATH" LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+export PROJECT=RPi DEVICE=RPi5 ARCH=aarch64
+export CUSTOM_VERSION=12.2.1-m4.1 BUILDER_NAME=pi-media-appliance CONCURRENCY_MAKE_LEVEL=7
+./scripts/unpack kodi
+make image
+```
+
+The build completed all 286 package steps and produced `LibreELEC-RPi5.aarch64-12.2-12.2.1-m4.1.img.gz` (164,545,224 bytes). Its SHA-256 is `1b0dbba7972dd369f65c6ce203ccf1e555dce8218a380e32e82a9d704d3e66f6`. The flash image, checksum, source archive, recipe patch and build and verification logs are in `C:/Code/artifacts/pi-media-m4`. Verification checked gzip integrity, both partitions, the Pi 5 device tree, the AArch64 Kodi binary, the cache-only path, Estuary setup and the packaged LibreELEC network overlay. The verification log records the matching flash and update payloads. This image has no bundled TMDB token. Physical boot and the acceptance runs are still open.
+
+Follow the [Pi acceptance matrix](milestone-4.md#7-run-acceptance-and-update-the-handoff) on a spare card. The test build can exercise first-boot network handoff, local-only playback and iOS pairing as shipped. A provider evaluation on the Pi needs the BitSearch switch and a local development TMDB credential in Kodi's environment. The LibreELEC `kodi.service` accepts an evaluation drop-in under `/storage/.config/system.d/kodi.service.d/`. Keep credentials in a separate owner-only file and account material on the Pi. The fresh-household acceptance still needs a selected provider and a fresh image with the distribution settings applied.
+
+For the owner's evaluation, copy `C:/Code/artifacts/pi-media-m4/appliance-evaluation.conf` to `/storage/.config/system.d/kodi.service.d/appliance-evaluation.conf`. Store `TMDB_API_KEY` in the referenced file with mode `0600`, then use `systemctl daemon-reload` and `systemctl restart kodi`. On the Pi, choose **Link TorBox** and authorize it from a signed-in phone using the on-screen code. Use the same account as the Fen baseline for the matched comparison. The device flow keeps the account key on the Pi. Remove the evaluation drop-in and credentials when the comparison is finished.
+
+```ini
+[Service]
+Environment=APPLIANCE_BITSEARCH_EVALUATION=1
+EnvironmentFile=/storage/.config/appliance-evaluation.env
+```
 
 ## Milestone 3 baseline
 

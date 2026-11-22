@@ -868,18 +868,21 @@ bool CNetworkServices::StartJSONRPCServer()
   if (IsJSONRPCServerRunning())
     return true;
 
-  if (!CTCPServer::StartServer(CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_jsonTcpPort, m_settings->GetBool(CSettings::SETTING_SERVICES_ESALLINTERFACES)))
+  const bool lan = m_settings->GetBool(CSettings::SETTING_SERVICES_ESALLINTERFACES);
+  const int port = CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_jsonTcpPort;
+  if (!CTCPServer::StartServer(port, lan))
     return false;
 
 #ifdef HAS_ZEROCONF
-  std::vector<std::pair<std::string, std::string> > txt;
-  txt.emplace_back("txtvers", "1");
-  txt.emplace_back("uuid", CServiceBroker::GetSettingsComponent()->GetSettings()->GetString(
-                             CSettings::SETTING_SERVICES_DEVICEUUID));
-
-  CZeroconf::GetInstance()->PublishService(
-      "servers.jsonrpc-tcp", "_xbmc-jsonrpc._tcp", CSysInfo::GetDeviceName(),
-      CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_jsonTcpPort, txt);
+  // A LAN client cannot connect to the loopback-only listener.
+  if (lan)
+  {
+    std::vector<std::pair<std::string, std::string>> txt;
+    txt.emplace_back("txtvers", "1");
+    txt.emplace_back("uuid", m_settings->GetString(CSettings::SETTING_SERVICES_DEVICEUUID));
+    CZeroconf::GetInstance()->PublishService("servers.jsonrpc-tcp", "_xbmc-jsonrpc._tcp",
+                                            CSysInfo::GetDeviceName(), port, txt);
+  }
 #endif // HAS_ZEROCONF
 
   return true;

@@ -479,12 +479,17 @@ TEST(TestAppliancePlayback, MovieIdentityDoesNotDependOnMemberBytes)
   CVariant files;
   ASSERT_TRUE(CJSONVariantParser::Parse(R"([
     {"id":0,"name":"Other.Movie.(2026).1080p.mkv","size":7200000123},
-    {"id":1,"name":"Pilot.Movie.(2026).1080p.mkv","size":-1}
+    {"id":1,"name":"Pilot.Movie.2026.1080p.mkv","size":-1},
+    {"id":3,"name":"Pilot.Movie.1990.1080p.mkv","size":7200000123}
   ])",
                                         files));
   const auto selected = SelectFile(files, movie);
   EXPECT_EQ(selected["id"].asInteger(-1), 1);
   EXPECT_EQ(FileSize::FromMemberBytes(selected["size"]).kind, SizeKind::Unknown);
+
+  movie["title"] = "Pilot Movie";
+  movie["query"] = "Pilot Movie (2026)";
+  EXPECT_EQ(SelectFile(files, movie)["id"].asInteger(-1), 1);
 
   CVariant duplicate = selected;
   duplicate["id"] = 2;

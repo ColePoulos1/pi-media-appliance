@@ -292,5 +292,7 @@ std::vector<FileCandidate> Discover(const CVariant& entry,
                                     const std::atomic_bool& cancelled);
 std::string Resolve(const CVariant& providers,
                     const ResolverRoute& route,
+                    const FileIdentity& identity,
+                    const CVariant& entry,
                     const std::atomic_bool& cancelled);
 } // namespace KODI::APPLIANCE

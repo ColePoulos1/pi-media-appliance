@@ -11,6 +11,8 @@ import sqlite3
 import subprocess
 import tempfile
 from collections import Counter
+from email import policy
+from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event, Thread
@@ -1310,12 +1312,12 @@ def account_check(userdata, port, phase):
             provider.shutdown()
 
 
-def remote_settings_check(userdata, port):
+def remote_settings_check(userdata, port, host):
     web_port = 19125
 
     def ping(password=None):
         request = Request(
-            f"http://127.0.0.1:{web_port}/jsonrpc",
+            f"http://{host}:{web_port}/jsonrpc",
             data=b'{"jsonrpc":"2.0","method":"JSONRPC.Ping","id":1}',
             headers={"Content-Type": "application/json"})
         if password:
@@ -1331,6 +1333,15 @@ def remote_settings_check(userdata, port):
 
     with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
         kodi = Kodi(connection)
+
+        def assert_lan_tcp_closed():
+            if host == "127.0.0.1":
+                return
+            try:
+                with socket.create_connection((host, port), timeout=2):
+                    raise AssertionError("Unauthenticated TCP JSON-RPC is reachable on the LAN address")
+            except ConnectionRefusedError:
+                pass
 
         def select(window):
             kodi.request("Input.Select")
@@ -1350,6 +1361,7 @@ def remote_settings_check(userdata, port):
         select(10000)
         assert kodi.call("Settings.SetSettingValue", setting="services.webserverport", value=web_port)
         assert ping() == "closed"
+        assert_lan_tcp_closed()
         open_remote()
         kodi.wait_until(lambda: kodi.label() == "Enable iOS remote")
         select(10100)
@@ -1359,6 +1371,7 @@ def remote_settings_check(userdata, port):
         assert original and len(original) == 20
         assert ping() == 401 and ping("wrong-fixture-password") == 401
         assert ping(original) == "pong"
+        assert_lan_tcp_closed()
         kodi.call("Input.Back")
         kodi.wait_until(lambda: kodi.window() == 10000)
 
@@ -1375,6 +1388,7 @@ def remote_settings_check(userdata, port):
         kodi.navigate("Down", lambda: kodi.label() == "Disable iOS remote")
         select(10000)
         kodi.wait_until(lambda: ping(replacement) == "closed")
+        assert_lan_tcp_closed()
         print("iOS settings: HTTP control closed by default, authenticated after enable and revocable")
 
 
@@ -1709,6 +1723,168 @@ def run(userdata, port, measure_frames=False):
                 provider.shutdown()
 
 
+def cached_discovery_check(userdata, port):
+    root = userdata / "appliance"
+    library = root / "library"
+    library.mkdir(parents=True)
+    movie = library / "movie-tmdb-900000051.mkv"
+    episode = library / "episode-tmdb-900000052.s01e02.mkv"
+    uncached = library / "movie-tmdb-900000053.mkv"
+    ambiguous = library / "episode-tmdb-900000054.s01e02.mkv"
+    for anchor in (movie, episode, uncached, ambiguous):
+        anchor.touch()
+    write_json(root / "index.json", {
+        "movie:tmdb:900000051": {"query": "Cache Movie (2026)", "title": "Cache Movie"},
+        "episode:tmdb:900000052": {"query": "Cache Show", "title": "Return", "episode": "s01e02",
+                                  "runtimeSeconds": 2700},
+        "movie:tmdb:900000053": {"query": "Cold Movie", "title": "Cold Movie"},
+        "episode:tmdb:900000054": {"query": "Double Show", "title": "Return", "episode": "s01e02"},
+    })
+    source = root / "synthetic.mkv"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "color=size=160x90:rate=10", "-t", "40", "-c:v", "mpeg4",
+                    str(source)], check=True)
+    media = source.read_bytes()
+    releases = {
+        "a" * 40: ["Cache.Movie.2026.1080p.WEB-DL.mkv"],
+        "b" * 40: ["Cache.Show.S01E02.Wrong.mkv", "Cache.Show.S01E03.Return.mkv",
+                   "Cache.Show.S01E02.Return.720p.WEB-DL.mkv"],
+        "c" * 40: ["Cold.Movie.1080p.WEB-DL.mkv"],
+        "d" * 40: ["Double.Show.S01E02.Return.mkv", "second/Double.Show.S01E02.Return.mkv"],
+        "e" * 40: ["Cache.Show.S01E02.Return.1080p.WEB-DL.mkv"],
+    }
+    cache = {
+        hash_: {"hash": hash_, "files": [
+            {"id": i, "name": name, "size": len(media)}
+            for i, name in enumerate(names)]}
+        for hash_, names in releases.items() if hash_ != "c" * 40
+    }
+    cache["e" * 40]["files"][0]["size"] = 2_000_000_000
+    account = {}
+    additions = []
+    resolutions = []
+    queries = []
+    optional = []
+
+    class CacheProvider(Provider):
+        def json_reply(self, data, status=200):
+            self.reply(status, json.dumps({"success": status == 200, "data": data}).encode(),
+                       "application/json")
+
+        def do_GET(self):
+            url = urlsplit(self.path)
+            query = parse_qs(url.query)
+            if url.path == "/api/v1/search" and "q" in query:
+                terms, = query["q"]
+                queries.append(terms)
+                assert "Authorization" not in self.headers and "X-Api-Key" not in self.headers
+                digits = {"Cache Movie (2026)": "a", "Cache Show s01e02": "e",
+                          "Cache Show s01": "be", "Cold Movie": "c",
+                          "Double Show s01e02": "d", "Double Show s01": "d"}[terms]
+                results = [{"infohash": digit * 40, "title": releases[digit * 40][-1],
+                            "size": 40_000_000_000} for digit in digits]
+                body = {"success": True, "results": results}
+                self.reply(200, json.dumps(body).encode(), "application/json")
+            elif url.path == "/api/v1/search":
+                assert self.headers["X-Api-Key"] == "synthetic-prowlarr"
+                optional.append(query["query"][0])
+                if optional[-1] == "Cache Show":
+                    body = [{"infoHash": "b" * 40, "title": "Cache.Show.S01.720p.WEB-DL"}]
+                    self.reply(200, json.dumps(body).encode(), "application/json")
+                else:
+                    self.json_reply(None, 503)
+            elif url.path.endswith("/checkcached"):
+                assert query["list_files"] == ["true"] and query["format"] == ["object"]
+                assert len(query["hash"]) == len(set(query["hash"]))
+                self.json_reply({hash_: cache[hash_] for hash_ in query["hash"] if hash_ in cache})
+            elif url.path.endswith("/mylist"):
+                if "id" in query:
+                    self.json_reply(account[int(query["id"][0])])
+                else:
+                    self.json_reply(list(account.values()))
+            elif url.path.endswith("/requestdl"):
+                route = (int(query["torrent_id"][0]), int(query["file_id"][0]))
+                resolutions.append(route)
+                source_name = "expired.mkv" if len(resolutions) == 1 else "playing.mkv"
+                self.json_reply(f"http://127.0.0.1:{self.server.server_port}/{source_name}")
+            else:
+                super().do_GET()
+
+        def do_POST(self):
+            assert self.path == "/v1/api/torrents/createtorrent"
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            message = BytesParser(policy=policy.default).parsebytes(
+                f"Content-Type: {self.headers['Content-Type']}\r\n\r\n".encode() + body)
+            fields = {part.get_param("name", header="Content-Disposition"): part.get_content()
+                      for part in message.iter_parts()}
+            assert fields["add_only_if_cached"] == "true", fields
+            prefix = "magnet:?xt=urn:btih:"
+            assert fields["magnet"].startswith(prefix)
+            hash_ = fields["magnet"][len(prefix):]
+            assert hash_ not in additions and hash_ in cache, hash_
+            additions.append(hash_)
+            if hash_ == "e" * 40:
+                del cache[hash_]
+                self.json_reply(None, 409)
+                return
+            torrent_id = len(additions)
+            account[torrent_id] = dict(
+                cache[hash_], id=torrent_id, download_finished=True, download_present=True,
+                files=[dict(member, id=member["id"] + 20) for member in cache[hash_]["files"]])
+            if hash_ == "a" * 40:
+                self.close_connection = True
+                return
+            self.json_reply({"hash": hash_, "torrent_id": torrent_id})
+
+        do_HEAD = do_GET
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), CacheProvider) as provider:
+        provider.media = media
+        provider.calls = Counter()
+        Thread(target=provider.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{provider.server_port}"
+        config = {"fixture": base, "cacheFixture": True}
+        write_json(root / "providers.json", config)
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+                kodi = Kodi(connection)
+                player = kodi.play(movie, timeout=20)
+                kodi.seek(player, 38)
+                assert kodi.wait_for("Player.OnStop")["end"] is True
+                assert additions == ["a" * 40] and resolutions == [(1, 20), (1, 20)]
+                assert provider.calls["expired"] > 0 and not optional
+                print("Empty account played a movie, recovered a lost add reply and refreshed its expired link.")
+
+                player = kodi.play(episode, timeout=20)
+                kodi.seek(player, 38)
+                assert kodi.wait_for("Player.OnStop")["end"] is True
+                assert additions == [digit * 40 for digit in "aeb"], additions
+                assert resolutions == [(1, 20), (1, 20), (3, 22)], resolutions
+                assert queries[:3] == ["Cache Movie (2026)", "Cache Show s01e02", "Cache Show s01"]
+                print("With Prowlarr absent, eviction advanced to the exact member of the cached pack.")
+
+                write_json(root / "providers.json",
+                           dict(config, prowlarr=base, prowlarrKey="synthetic-prowlarr"))
+                for anchor in (movie, episode):
+                    player = kodi.play(anchor, timeout=20)
+                    kodi.stop(player)
+                assert len(additions) == 3 and resolutions[-2:] == [(1, 20), (3, 22)]
+                print("Optional discovery failure and a duplicate release preserved the ready routes.")
+
+                for anchor in (uncached, ambiguous):
+                    kodi.call("Player.Open", item={"file": str(anchor)})
+                    kodi.wait_until(lambda: kodi.window() == 12000)
+                    kodi.call("Input.Back")
+                    kodi.wait_until(lambda: kodi.window() != 12000)
+                    assert kodi.call("Player.GetActivePlayers") == []
+                assert len(additions) == 3 and len(resolutions) == 5
+                assert optional == ["Cache Movie (2026)", "Cache Show", "Cold Movie", "Double Show"]
+                print("Uncached and ambiguous releases ended without acquisition or resolution.")
+                kodi.call("Application.Quit")
+        finally:
+            provider.shutdown()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("userdata", type=Path, help="userdata folder of an isolated Kodi profile")
@@ -1721,6 +1897,9 @@ if __name__ == "__main__":
     parser.add_argument("--catalog", action="store_true")
     parser.add_argument("--smb-folder", action="store_true")
     parser.add_argument("--remote-settings", action="store_true")
+    parser.add_argument("--remote-host", default="127.0.0.1",
+                        help="IPv4 address to probe for HTTP and LAN TCP during remote settings checks")
+    parser.add_argument("--cached-discovery", action="store_true")
     parser.add_argument("--measure-frames", action="store_true",
                         help="sample first visible frames on a 1280x720x24 Linux Xvfb display")
     args = parser.parse_args()
@@ -1740,6 +1919,8 @@ if __name__ == "__main__":
     elif args.smb_folder:
         smb_folder_check(userdata, args.port)
     elif args.remote_settings:
-        remote_settings_check(userdata, args.port)
+        remote_settings_check(userdata, args.port, args.remote_host)
+    elif args.cached_discovery:
+        cached_discovery_check(userdata, args.port)
     else:
         run(userdata, args.port, args.measure_frames)
